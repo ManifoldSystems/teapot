@@ -45,6 +45,47 @@ the same.
 
 ## Control
 
-Not built yet. Planned: HTTPS + WebSocket to `teapot-control` (Cloudflare
-Workers), device authenticated by signing a server nonce with its secret key,
-API under `/v1/`.
+HTTPS + WebSocket to `teapot-control` (Cloudflare Workers). Responses are
+`{success, data, ...}`; errors `{success: false, message, error}`. Clients
+send their own `User-Agent` (`teapot/<version>`): Cloudflare rejects library
+defaults like `Python-urllib` with `403` / error `1010`.
+
+### Auth
+
+```
+POST /v1/auth/challenge {node_id}
+  → data: {challenge, expires_at}
+POST /v1/auth/verify {node_id, challenge, signature}
+  → data: {token, expires_at, status: "pending" | "approved"}
+```
+
+- `node_id`: 64 lowercase hex chars (the endpoint id).
+- `challenge`: opaque string, valid 60 s, bound to `node_id`.
+- `signature`: hex of the 64-byte Ed25519 signature over the UTF-8 bytes of
+  `challenge`, made with the device secret key.
+- `token`: Bearer for everything below, valid 24 h. First login creates the
+  device as `pending`; the owner approves it in the dashboard.
+
+### Device API
+
+| Method | Path | Body / result |
+|---|---|---|
+| GET | `/v1/devices/me` | device row |
+| PUT | `/v1/devices/me` | `{name?, platform?, can_exit}` |
+| GET | `/v1/peers` | `[{node_id, name, platform, online, exit}]`; `403 PENDING` until approved |
+| GET | `/v1/exit/allowlist` | `{exit_enabled, allow: [node_id]}`; `403 PENDING` until approved |
+| GET | `/v1/presence` | WebSocket upgrade; token as Bearer or `?token=` |
+
+`401` means authenticate again (expired token, or the device was removed).
+
+### Presence socket
+
+Online = the socket is open. One socket per device.
+
+```
+client → "ping"                        server → "pong"
+client → {"type":"status","paths":[{"peer":<node_id>,"kind":"direct"|"relay","rtt_ms":n}]}
+server → {"type":"peers_changed"}      refetch /v1/peers and /v1/exit/allowlist
+close 4000  replaced by a newer connection of the same device
+close 4001  removed or revoked from the dashboard
+```
