@@ -122,4 +122,4 @@ crates/teapot         CLI, service install (launchd / systemd)
 - SOCKS5
 - `--system-proxy` tried on a real Mac (written and unit-tested; it changes
   system network settings, so run it yourself first)
-- systemd unit tested on a real Linux box / Raspberry Pi (written, not yet run)
+- systemd unit tried on a Raspberry Pi (runs on Ubuntu 24.04 x86_64)

@@ -1,15 +1,13 @@
 //! `teapot up` as a background service: a launchd agent on macOS, a systemd
 //! user unit on Linux. Both restart it when it exits.
 
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{path::PathBuf, process::Command};
 
 use anyhow::{Context, bail};
 
 use crate::{DEFAULT_CONTROL, UpArgs};
 
+#[cfg(target_os = "macos")]
 const LABEL: &str = "com.manifoldsystems.teapot";
 const DEFAULT_LISTEN: &str = "127.0.0.1:1080";
 
@@ -100,7 +98,8 @@ fn run(cmd: &mut Command) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn tail(path: &Path, lines: usize) -> String {
+#[cfg(target_os = "macos")]
+fn tail(path: &std::path::Path, lines: usize) -> String {
     std::fs::read_to_string(path)
         .map(|s| {
             let all: Vec<&str> = s.lines().collect();
