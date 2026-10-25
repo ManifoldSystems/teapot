@@ -15,3 +15,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
+hostname = { workspace = true }
+rustls = { workspace = true }
