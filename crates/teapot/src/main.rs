@@ -1,12 +1,15 @@
+mod service;
+
 use std::{
     collections::HashSet, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc, time::Duration,
 };
 
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use iroh::{EndpointId, SecretKey, protocol::Router};
 use teapot_core::{
-    control::{self, ControlClient, DeviceInfo, Peer},
+    agent,
+    control::{self, ControlClient, DeviceInfo},
     exit::{Allow, ExitNode, ExitPolicy},
     key,
     paths::PathBook,
@@ -17,7 +20,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 /// Each buyer's clone points this at their own deployment.
-const DEFAULT_CONTROL: &str = "https://teapot-control.example.workers.dev";
+pub const DEFAULT_CONTROL: &str = "https://teapot-control.example.workers.dev";
 
 #[derive(Parser)]
 #[command(version, about = "Personal mesh on iroh")]
@@ -51,9 +54,17 @@ enum Cmd {
     },
     /// Log in to control and show this device and its peers.
     Status,
-    /// Act as an exit node: dial the internet for allowed clients.
+    /// Stay online: serve as an exit node when the dashboard allows it, and
+    /// run a local proxy that exits through another device.
+    Up(UpArgs),
+    /// Install or remove `teapot up` as a background service.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+    /// Only serve as an exit node (same as `up --no-proxy`).
     ///
-    /// The allowlist comes from control unless --allow or --allow-any is given.
+    /// --allow / --allow-any skip control and use a static allowlist.
     Exit {
         /// Endpoint id allowed to use this exit node, without control. Repeatable.
         #[arg(long = "allow", value_name = "ENDPOINT_ID")]
@@ -65,10 +76,9 @@ enum Cmd {
         #[arg(long)]
         allow_lan: bool,
     },
-    /// Run a local HTTP proxy that exits through another device.
+    /// Only run the local proxy (same as `up --no-exit --exit <EXIT>`).
     Proxy {
-        /// Exit node: name, endpoint id, or id prefix. Default: the first
-        /// online exit node from control.
+        /// Preferred exit node: name, endpoint id, or id prefix.
         exit: Option<String>,
         #[arg(long, default_value = "127.0.0.1:1080")]
         listen: SocketAddr,
@@ -76,6 +86,37 @@ enum Cmd {
         #[arg(long)]
         no_control: bool,
     },
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct UpArgs {
+    /// Preferred exit node (name, id, or id prefix). Falls back to another
+    /// online exit while it is offline. Default: any online exit.
+    #[arg(long)]
+    exit: Option<String>,
+    /// Local HTTP proxy address.
+    #[arg(long, default_value = "127.0.0.1:1080")]
+    listen: SocketAddr,
+    /// Do not run the local proxy.
+    #[arg(long)]
+    no_proxy: bool,
+    /// Do not offer this device as an exit node.
+    #[arg(long, conflicts_with = "no_proxy")]
+    no_exit: bool,
+    /// Let exit clients reach this machine's LAN and loopback.
+    #[arg(long)]
+    allow_lan: bool,
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Write a launchd agent (macOS) or systemd user unit (Linux) that runs
+    /// `teapot up` with these options, and start it.
+    Install(UpArgs),
+    /// Stop and remove the service.
+    Uninstall,
+    /// Show whether the service is installed and running.
+    Status,
 }
 
 #[tokio::main]
@@ -90,6 +131,19 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
+
+    // Service management never touches the key or the network.
+    if let Cmd::Service { cmd } = &cli.cmd {
+        return match cmd {
+            ServiceCmd::Install(args) => service::install(
+                &service::global_args(&cli.key, &cli.control, &cli.name),
+                args,
+            ),
+            ServiceCmd::Uninstall => service::uninstall(),
+            ServiceCmd::Status => service::status(),
+        };
+    }
+
     let key_path = match &cli.key {
         Some(path) => path.clone(),
         None => dirs::config_dir()
@@ -99,67 +153,56 @@ async fn main() -> anyhow::Result<()> {
     };
     let secret_key = key::load_or_create(&key_path)?;
 
-    match cli.cmd {
+    match &cli.cmd {
         Cmd::Id => println!("{}", secret_key.public()),
-        Cmd::Login { no_browser } => login(&cli, secret_key, no_browser).await?,
+        Cmd::Login { no_browser } => login(&cli, secret_key, *no_browser).await?,
         Cmd::Status => status(&cli.control, secret_key).await?,
+        Cmd::Service { .. } => unreachable!("handled above"),
+        Cmd::Up(args) => up(&cli, secret_key, args.clone()).await?,
         Cmd::Exit {
-            ref allow,
+            allow,
             allow_any,
             allow_lan,
         } => {
-            let paths = PathBook::default();
-            let allow = if allow_any {
-                Allow::Any
-            } else if !allow.is_empty() {
-                Allow::Only(allow.iter().copied().collect::<HashSet<_>>())
+            if *allow_any || !allow.is_empty() {
+                let allow = if *allow_any {
+                    Allow::Any
+                } else {
+                    Allow::Only(allow.iter().copied().collect())
+                };
+                static_exit(secret_key, allow, *allow_lan).await?;
             } else {
-                let control = join_control(&cli, secret_key.clone(), Some(true)).await?;
-                tokio::spawn(control.clone().run_presence(paths.clone()));
-                let (tx, rx) = watch::channel(HashSet::new());
-                tokio::spawn(sync_allowlist(control, tx));
-                Allow::Live(rx)
-            };
-            let endpoint = teapot_core::bind(secret_key).await?;
-            let router = Router::builder(endpoint)
-                .accept(
-                    ALPN_PROXY,
-                    ExitNode::new(ExitPolicy { allow, allow_lan }, paths),
-                )
-                .spawn();
-            router.endpoint().online().await;
-            info!(id = %router.endpoint().id(), allow_lan, "exit node ready");
-            tokio::signal::ctrl_c().await?;
-            router.shutdown().await?;
+                let args = UpArgs {
+                    exit: None,
+                    listen: "127.0.0.1:1080".parse()?,
+                    no_proxy: true,
+                    no_exit: false,
+                    allow_lan: *allow_lan,
+                };
+                up(&cli, secret_key, args).await?;
+            }
         }
         Cmd::Proxy {
-            ref exit,
+            exit,
             listen,
             no_control,
         } => {
-            let paths = PathBook::default();
-            let exit_id = if no_control {
+            if *no_control {
                 let Some(exit) = exit else {
                     bail!("--no-control needs the exit node's endpoint id");
                 };
-                EndpointId::from_str(exit).context("EXIT must be a full endpoint id")?
+                let id = EndpointId::from_str(exit).context("EXIT must be a full endpoint id")?;
+                static_proxy(secret_key, id, *listen).await?;
             } else {
-                let control = join_control(&cli, secret_key.clone(), None).await?;
-                tokio::spawn(control.clone().run_presence(paths.clone()));
-                let peers = wait_for_peers(&control).await?;
-                let (id, label) = choose_exit(&peers, exit.as_deref())?;
-                info!(exit = %label, "using exit node");
-                id
-            };
-
-            let endpoint = teapot_core::bind(secret_key).await?;
-            info!(id = %endpoint.id(), "client ready");
-            let client = Arc::new(ProxyClient::new(endpoint.clone(), exit_id, paths));
-            tokio::select! {
-                res = proxy::serve(listen, client) => res?,
-                _ = tokio::signal::ctrl_c() => {}
+                let args = UpArgs {
+                    exit: exit.clone(),
+                    listen: *listen,
+                    no_proxy: false,
+                    no_exit: true,
+                    allow_lan: false,
+                };
+                up(&cli, secret_key, args).await?;
             }
-            endpoint.close().await;
         }
     }
     Ok(())
@@ -175,141 +218,102 @@ fn device_name(cli: &Cli) -> String {
     })
 }
 
-/// Logs in, registers name/platform, and says so if approval is pending.
-async fn join_control(
-    cli: &Cli,
-    key: SecretKey,
-    can_exit: Option<bool>,
-) -> anyhow::Result<Arc<ControlClient>> {
-    let control = Arc::new(ControlClient::new(&cli.control, key)?);
-    let status = control
-        .login()
-        .await
-        .with_context(|| format!("logging in to {}", control.base()))?;
-    let name = device_name(cli);
-    control
-        .update_me(&DeviceInfo {
-            name: Some(name.clone()),
+/// One endpoint, one presence socket: exit node and proxy side by side.
+async fn up(cli: &Cli, key: SecretKey, args: UpArgs) -> anyhow::Result<()> {
+    let offer_exit = !args.no_exit;
+    let run_proxy = !args.no_proxy;
+    let paths = PathBook::default();
+
+    let control = agent::join(
+        &cli.control,
+        key.clone(),
+        DeviceInfo {
+            name: Some(device_name(cli)),
             platform: Some(std::env::consts::OS.into()),
-            can_exit,
-        })
-        .await?;
-    if status == "approved" {
-        info!(%name, "logged in to control");
+            can_exit: Some(offer_exit),
+        },
+    )
+    .await?;
+    tokio::spawn(control.clone().run_presence(paths.clone()));
+
+    let endpoint = teapot_core::bind(key).await?;
+
+    let router = offer_exit.then(|| {
+        let (tx, rx) = watch::channel(HashSet::new());
+        tokio::spawn(agent::sync_allowlist(control.clone(), tx));
+        let policy = ExitPolicy {
+            allow: Allow::Live(rx),
+            allow_lan: args.allow_lan,
+        };
+        Router::builder(endpoint.clone())
+            .accept(ALPN_PROXY, ExitNode::new(policy, paths.clone()))
+            .spawn()
+    });
+
+    let proxy_task = if run_proxy {
+        let client = Arc::new(ProxyClient::new(endpoint.clone(), None, paths.clone()));
+        tokio::spawn(agent::follow_exits(
+            control.clone(),
+            client.clone(),
+            args.exit.clone(),
+        ));
+        Some(tokio::spawn(proxy::serve(args.listen, client)))
     } else {
-        warn!(
-            "{name} ({}) is waiting for approval; run `teapot login` or open {}",
-            &control.node_id()[..8],
-            control.approve_url()
-        );
-    }
-    Ok(control)
-}
-
-/// Retries `/v1/peers` until the device is approved.
-async fn wait_for_peers(control: &ControlClient) -> anyhow::Result<Vec<Peer>> {
-    let mut changed = control.subscribe();
-    loop {
-        match control.peers().await {
-            Ok(peers) => return Ok(peers),
-            Err(e) if control::is_pending(&e) => {}
-            Err(e) => return Err(e),
-        }
-        tokio::select! {
-            _ = changed.changed() => {}
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
-        }
-    }
-}
-
-fn choose_exit(peers: &[Peer], wanted: Option<&str>) -> anyhow::Result<(EndpointId, String)> {
-    let pick = match wanted {
-        Some(w) => {
-            let found = peers.iter().find(|p| {
-                p.node_id == w
-                    || p.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(w))
-                    || (w.len() >= 8 && p.node_id.starts_with(w))
-            });
-            let Some(p) = found else {
-                bail!("no approved device matches {w:?}; see `teapot status`");
-            };
-            if !p.exit {
-                bail!(
-                    "{} is not an enabled exit node; turn exit on in the dashboard",
-                    p.label()
-                );
-            }
-            if !p.online {
-                warn!("{} is offline right now; will keep trying", p.label());
-            }
-            p
-        }
-        None => {
-            let exits: Vec<&Peer> = peers.iter().filter(|p| p.exit).collect();
-            let Some(p) = exits.iter().find(|p| p.online) else {
-                if exits.is_empty() {
-                    bail!(
-                        "no exit nodes; run `teapot exit` on a device and enable it in the dashboard"
-                    );
-                }
-                let names: Vec<String> = exits.iter().map(|p| p.label()).collect();
-                bail!("no exit node is online (offline: {})", names.join(", "));
-            };
-            let others: Vec<String> = exits
-                .iter()
-                .filter(|o| o.online && o.node_id != p.node_id)
-                .map(|o| o.label())
-                .collect();
-            if !others.is_empty() {
-                info!(
-                    "also online: {} (`teapot proxy <name>` to choose)",
-                    others.join(", ")
-                );
-            }
-            *p
-        }
+        None
     };
-    Ok((EndpointId::from_str(&pick.node_id)?, pick.label()))
+
+    endpoint.online().await;
+    info!(
+        id = %endpoint.id(),
+        exit = offer_exit,
+        proxy = %if run_proxy { args.listen.to_string() } else { "off".into() },
+        "teapot is up"
+    );
+
+    match proxy_task {
+        Some(task) => tokio::select! {
+            res = task => res??,
+            _ = tokio::signal::ctrl_c() => {}
+        },
+        None => tokio::signal::ctrl_c().await?,
+    }
+
+    if let Some(router) = router {
+        router.shutdown().await?;
+    }
+    endpoint.close().await;
+    Ok(())
 }
 
-/// Keeps the exit node's allowlist equal to control's, refetching whenever
-/// control broadcasts a change (and every minute as a fallback).
-async fn sync_allowlist(control: Arc<ControlClient>, tx: watch::Sender<HashSet<EndpointId>>) {
-    let mut changed = control.subscribe();
-    let mut enabled: Option<bool> = None;
-    loop {
-        match control.allowlist().await {
-            Ok(list) => {
-                if enabled != Some(list.exit_enabled) {
-                    if list.exit_enabled {
-                        info!("exit is enabled in the dashboard");
-                    } else {
-                        warn!("exit is off for this device; turn it on in the dashboard");
-                    }
-                    enabled = Some(list.exit_enabled);
-                }
-                let set: HashSet<EndpointId> = list
-                    .allow
-                    .iter()
-                    .filter_map(|id| EndpointId::from_str(id).ok())
-                    .collect();
-                tx.send_if_modified(|current| {
-                    if *current == set {
-                        return false;
-                    }
-                    info!(clients = set.len(), "allowlist updated");
-                    *current = set;
-                    true
-                });
-            }
-            Err(e) if control::is_pending(&e) => {}
-            Err(e) => warn!("allowlist: {e:#}"),
-        }
-        tokio::select! {
-            _ = changed.changed() => {}
-            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-        }
+async fn static_exit(key: SecretKey, allow: Allow, allow_lan: bool) -> anyhow::Result<()> {
+    let endpoint = teapot_core::bind(key).await?;
+    let router = Router::builder(endpoint)
+        .accept(
+            ALPN_PROXY,
+            ExitNode::new(ExitPolicy { allow, allow_lan }, PathBook::default()),
+        )
+        .spawn();
+    router.endpoint().online().await;
+    info!(id = %router.endpoint().id(), allow_lan, "exit node ready (static allowlist)");
+    tokio::signal::ctrl_c().await?;
+    router.shutdown().await?;
+    Ok(())
+}
+
+async fn static_proxy(key: SecretKey, exit: EndpointId, listen: SocketAddr) -> anyhow::Result<()> {
+    let endpoint = teapot_core::bind(key).await?;
+    info!(id = %endpoint.id(), "client ready");
+    let client = Arc::new(ProxyClient::new(
+        endpoint.clone(),
+        Some(exit),
+        PathBook::default(),
+    ));
+    tokio::select! {
+        res = proxy::serve(listen, client) => res?,
+        _ = tokio::signal::ctrl_c() => {}
     }
+    endpoint.close().await;
+    Ok(())
 }
 
 async fn login(cli: &Cli, key: SecretKey, no_browser: bool) -> anyhow::Result<()> {
@@ -350,7 +354,7 @@ async fn login(cli: &Cli, key: SecretKey, no_browser: bool) -> anyhow::Result<()
             Err(e) => warn!("{e:#}"),
         }
     }
-    println!("✓ {name} added. Run `teapot exit` or `teapot proxy` on it.");
+    println!("✓ {name} added. Next: `teapot service install` to keep it online.");
     Ok(())
 }
 
@@ -390,8 +394,9 @@ async fn status(base: &str, key: SecretKey) -> anyhow::Result<()> {
         "exit      {}",
         match (me.can_exit, me.exit_enabled) {
             (true, true) => "on",
-            (true, false) => "capable, off in dashboard",
-            _ => "not running as exit node",
+            (true, false) => "offered, off in dashboard",
+            (false, true) => "on in dashboard, not offered by this device right now",
+            (false, false) => "off",
         }
     );
     println!("public ip {}", me.last_ip.as_deref().unwrap_or("-"));
@@ -415,53 +420,9 @@ async fn status(base: &str, key: SecretKey) -> anyhow::Result<()> {
             }
         }
         Err(e) if control::is_pending(&e) => {
-            println!("\nwaiting for approval; approve this device at {base}")
+            println!("\nwaiting for approval; run `teapot login`")
         }
         Err(e) => return Err(e),
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn peer(name: &str, online: bool, exit: bool) -> Peer {
-        Peer {
-            node_id: SecretKey::generate().public().to_string(),
-            name: Some(name.into()),
-            platform: None,
-            online,
-            exit,
-        }
-    }
-
-    #[test]
-    fn picks_first_online_exit() {
-        let peers = [
-            peer("laptop", true, false),
-            peer("vps", false, true),
-            peer("raspi", true, true),
-        ];
-        assert_eq!(choose_exit(&peers, None).unwrap().1, "raspi");
-    }
-
-    #[test]
-    fn by_name_or_prefix() {
-        let peers = [peer("raspi", true, true), peer("vps", true, true)];
-        assert_eq!(choose_exit(&peers, Some("VPS")).unwrap().1, "vps");
-        let prefix = &peers[0].node_id[..10];
-        assert_eq!(choose_exit(&peers, Some(prefix)).unwrap().1, "raspi");
-    }
-
-    #[test]
-    fn explains_why_not() {
-        let peers = [peer("laptop", true, false), peer("vps", false, true)];
-        let err = choose_exit(&peers, Some("laptop")).unwrap_err().to_string();
-        assert!(err.contains("not an enabled exit node"), "{err}");
-        let err = choose_exit(&peers, None).unwrap_err().to_string();
-        assert!(err.contains("offline: vps"), "{err}");
-        let err = choose_exit(&peers[..1], None).unwrap_err().to_string();
-        assert!(err.contains("no exit nodes"), "{err}");
-    }
 }
