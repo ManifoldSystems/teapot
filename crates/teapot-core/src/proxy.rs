@@ -16,7 +16,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::paths::PathBook;
+use crate::paths::{Counted, PathBook};
 
 const MAX_HEAD: usize = 16 * 1024;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,6 +29,7 @@ pub struct ProxyClient {
     /// One dial at a time; concurrent requests wait for it and share the result.
     dial: Mutex<()>,
     paths: PathBook,
+    exit_tx: tokio::sync::watch::Sender<Option<EndpointId>>,
 }
 
 /// The chosen exit node and the connection to it, swapped together.
@@ -45,7 +46,13 @@ impl ProxyClient {
             state: Mutex::new(State { exit, conn: None }),
             dial: Mutex::new(()),
             paths,
+            exit_tx: tokio::sync::watch::Sender::new(exit),
         }
+    }
+
+    /// Fires whenever the chosen exit node changes (including to none).
+    pub fn watch_exit(&self) -> tokio::sync::watch::Receiver<Option<EndpointId>> {
+        self.exit_tx.subscribe()
     }
 
     pub async fn exit(&self) -> Option<EndpointId> {
@@ -63,6 +70,7 @@ impl ProxyClient {
             old.close(0u32.into(), b"switching exit node");
         }
         state.exit = exit;
+        self.exit_tx.send_replace(exit);
         true
     }
 
@@ -110,8 +118,10 @@ impl ProxyClient {
     }
 
     /// Opens a stream to the exit node and asks it to dial `target`.
-    pub async fn open(&self, target: &str) -> anyhow::Result<(SendStream, RecvStream)> {
+    /// Returns the streams and which exit node they go to.
+    pub async fn open(&self, target: &str) -> anyhow::Result<(SendStream, RecvStream, EndpointId)> {
         let conn = self.connection().await?;
+        let exit = conn.remote_id();
         let result = async {
             let (mut send, mut recv) = conn.open_bi().await?;
             let req = ConnectRequest {
@@ -119,7 +129,7 @@ impl ProxyClient {
             };
             send.write_all(&req.encode()).await?;
             match ConnectResponse::parse(&read_line(&mut recv).await?)? {
-                ConnectResponse::Ok => Ok((send, recv)),
+                ConnectResponse::Ok => Ok((send, recv, exit)),
                 ConnectResponse::Err(reason) => bail!("exit node refused {target}: {reason}"),
             }
         }
@@ -217,7 +227,7 @@ async fn handle_http(mut sock: TcpStream, client: &ProxyClient) -> anyhow::Resul
     };
     let rest = &buf[head_end..];
 
-    let (send, recv) = match client.open(&target).await {
+    let (send, recv, exit) = match client.open(&target).await {
         Ok(streams) => streams,
         Err(e) => {
             let body = format!("{e:#}\n");
@@ -231,6 +241,7 @@ async fn handle_http(mut sock: TcpStream, client: &ProxyClient) -> anyhow::Resul
     };
     let mut tunnel = tokio::io::join(recv, send);
 
+    let preamble_len = preamble.as_ref().map_or(0, String::len);
     match preamble {
         None => {
             sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -242,6 +253,9 @@ async fn handle_http(mut sock: TcpStream, client: &ProxyClient) -> anyhow::Resul
         tunnel.write_all(rest).await?;
     }
 
+    let counter = client.paths.counter(exit);
+    counter.add_tx(rest.len() + preamble_len);
+    let mut sock = Counted::new(sock, counter);
     let (up, down) = tokio::io::copy_bidirectional(&mut sock, &mut tunnel).await?;
     debug!(%target, up, down, "closed");
     Ok(())

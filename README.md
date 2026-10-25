@@ -50,6 +50,19 @@ Options given to `teapot service install` are passed to `up`, e.g.
 
 `teapot exit` and `teapot proxy` are `up --no-proxy` and `up --no-exit`.
 
+**Whole-Mac exit (`--system-proxy`, macOS).** Points the system HTTP/HTTPS
+proxy at `127.0.0.1:1080` while an exit node is available, so browsers and
+most apps go out through it without per-app settings. With no exit node
+online it switches the proxy back off, so the Mac never loses internet
+because of teapot. The original settings are saved before anything changes
+and restored on shutdown (Ctrl+C or the service stopping), on the next start
+after a crash, by `teapot service uninstall`, or by hand with
+`teapot system-proxy off`. Needs an admin account (`networksetup`).
+
+**Exit nodes keep working when control is down.** The last allowlist from
+control is cached next to the key (`secret.allowlist.json`) and used at
+startup until control answers again.
+
 Point apps at `http://127.0.0.1:1080`:
 
 ```bash
@@ -85,13 +98,15 @@ teapot proxy --no-control <B_ID>           # on A
 | `--allow-lan` | exit | Let clients reach B's loopback and LAN. Off by default |
 | `--exit <name>` / `[EXIT]` | up / proxy | Preferred exit node by name, id, or id prefix (≥ 8 chars) |
 | `--no-proxy` / `--no-exit` | up | Skip the local proxy / never offer exit |
+| `--system-proxy` | up | macOS: route the whole Mac through the proxy while an exit is available |
 | `--listen <addr>` | proxy | Local proxy address. Default `127.0.0.1:1080` |
 | `--no-control` | proxy | Skip control; `EXIT` must be a full id |
 | `--no-browser` | login | Print the approval link instead of opening it |
 | `RUST_LOG` | all | e.g. `teapot_core=debug` for per-stream logs |
 
 The proxy logs which path it uses (`path: relay ...` or `path: direct ...`)
-whenever it changes, and every device reports its paths to the dashboard.
+whenever it changes. Every device reports its paths and tunnel bytes per peer
+(since the agent started) to the dashboard.
 
 ## Layout
 
@@ -105,4 +120,6 @@ crates/teapot         CLI, service install (launchd / systemd)
 ## Not yet
 
 - SOCKS5
+- `--system-proxy` tried on a real Mac (written and unit-tested; it changes
+  system network settings, so run it yourself first)
 - systemd unit tested on a real Linux box / Raspberry Pi (written, not yet run)

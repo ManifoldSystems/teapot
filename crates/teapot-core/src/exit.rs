@@ -12,7 +12,10 @@ use teapot_proto::{ConnectRequest, ConnectResponse, read_line};
 use tokio::{io::AsyncWriteExt, sync::watch};
 use tracing::{debug, info, warn};
 
-use crate::{net, paths::PathBook};
+use crate::{
+    net,
+    paths::{Counted, PathBook},
+};
 
 #[derive(Debug, Clone)]
 pub enum Allow {
@@ -92,8 +95,9 @@ impl ProtocolHandler for ExitNode {
                 }
             };
             let policy = self.policy.clone();
+            let paths = self.paths.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_stream(send, recv, &policy).await {
+                if let Err(e) = handle_stream(send, recv, &policy, &paths, peer).await {
                     debug!(%peer, "stream ended: {e:#}");
                 }
             });
@@ -113,10 +117,12 @@ async fn handle_stream(
     mut send: SendStream,
     mut recv: RecvStream,
     policy: &ExitPolicy,
+    paths: &PathBook,
+    peer: EndpointId,
 ) -> anyhow::Result<()> {
     let req = ConnectRequest::parse(&read_line(&mut recv).await?)?;
 
-    let mut tcp = match net::dial(&req.target, policy.allow_lan).await {
+    let tcp = match net::dial(&req.target, policy.allow_lan).await {
         Ok(tcp) => tcp,
         Err(e) => {
             warn!(target = %req.target, "dial refused: {e:#}");
@@ -130,6 +136,7 @@ async fn handle_stream(
     debug!(target = %req.target, "tunnel open");
 
     let mut tunnel = tokio::io::join(recv, send);
+    let mut tcp = Counted::new(tcp, paths.counter(peer));
     let (up, down) = tokio::io::copy_bidirectional(&mut tunnel, &mut tcp).await?;
     tunnel.shutdown().await.ok();
     debug!(target = %req.target, up, down, "tunnel closed");

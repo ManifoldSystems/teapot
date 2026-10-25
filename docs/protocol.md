@@ -50,6 +50,9 @@ HTTPS + WebSocket to `teapot-control` (Cloudflare Workers). Responses are
 send their own `User-Agent` (`teapot/<version>`): Cloudflare rejects library
 defaults like `Python-urllib` with `403` / error `1010`.
 
+`POST /login` is limited to 10 requests a minute per IP and `/v1/auth/*` to
+60; over the limit answers `429`.
+
 ### Auth
 
 ```
@@ -84,7 +87,11 @@ Online = the socket is open. One socket per device.
 
 ```
 client → "ping"                        server → "pong"
-client → {"type":"status","paths":[{"peer":<node_id>,"kind":"direct"|"relay","rtt_ms":n}]}
+client → {"type":"status",
+          "paths":[{"peer":<node_id>,"kind":"direct"|"relay","rtt_ms":n}],
+          "traffic":[{"peer":<node_id>,"tx":bytes,"rx":bytes}]}
+         traffic = tunnel payload since the agent started, from the sender's
+         side (tx went to the peer, rx came from it)
 server → {"type":"peers_changed"}      approval, exit, or online state changed:
                                        refetch /v1/peers and /v1/exit/allowlist
 close 4000  replaced by a newer connection of the same device

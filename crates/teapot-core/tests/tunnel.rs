@@ -45,7 +45,15 @@ async fn exit_node(lookup: &MemoryLookup, allow: Allow, allow_lan: bool) -> (End
 
 /// Local proxy pointed at `exit`; returns its address and the client.
 async fn proxy(client_ep: Endpoint, exit: EndpointId) -> (String, Arc<ProxyClient>) {
-    let client = Arc::new(ProxyClient::new(client_ep, Some(exit), PathBook::default()));
+    proxy_with(client_ep, exit, PathBook::default()).await
+}
+
+async fn proxy_with(
+    client_ep: Endpoint,
+    exit: EndpointId,
+    paths: PathBook,
+) -> (String, Arc<ProxyClient>) {
+    let client = Arc::new(ProxyClient::new(client_ep, Some(exit), paths));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(proxy::serve_listener(listener, client.clone()));
