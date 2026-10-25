@@ -72,8 +72,8 @@ curl -x http://127.0.0.1:1080 https://ifconfig.me
 It prints B's public IP. A and B on the same network share one IP, so test
 across networks (laptop on Wi-Fi, B on a phone hotspot or a VPS).
 
-`teapot status` shows this device's approval, exit state, last public IP, and
-its peers.
+`teapot status` shows this device's approval, exit state, public IPv4/IPv6
+(reported by the agent from its iroh addresses), and its peers.
 
 Revoking or removing a device in the dashboard disconnects it from every exit
 node within a second or two.

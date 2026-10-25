@@ -89,9 +89,13 @@ Online = the socket is open. One socket per device.
 client → "ping"                        server → "pong"
 client → {"type":"status",
           "paths":[{"peer":<node_id>,"kind":"direct"|"relay","rtt_ms":n}],
-          "traffic":[{"peer":<node_id>,"tx":bytes,"rx":bytes}]}
+          "traffic":[{"peer":<node_id>,"tx":bytes,"rx":bytes}],
+          "ips":{"v4":"a.b.c.d"?,"v6":"x:y::z"?}}
          traffic = tunnel payload since the agent started, from the sender's
          side (tx went to the peer, rx came from it)
+         ips = this device's public addresses from its own iroh endpoint
+         addresses (LAN/loopback/CGNAT/ULA dropped); control only sees the
+         one family the socket uses
 server → {"type":"peers_changed"}      approval, exit, or online state changed:
                                        refetch /v1/peers and /v1/exit/allowlist
 close 4000  replaced by a newer connection of the same device
