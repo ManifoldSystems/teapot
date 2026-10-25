@@ -26,7 +26,17 @@ const STATUS_REFRESH: Duration = Duration::from_secs(60);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// What the presence status message carries.
-type Report = (Vec<PeerPath>, Vec<PeerTraffic>);
+type Report = (Vec<PeerPath>, Vec<PeerTraffic>, PublicIps);
+
+/// This device's public addresses as iroh's net report sees them. Control
+/// only sees the one family the presence socket happens to use.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PublicIps {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v4: Option<std::net::Ipv4Addr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v6: Option<std::net::Ipv6Addr>,
+}
 
 #[derive(Debug, Deserialize)]
 struct Envelope<T> {
@@ -70,6 +80,10 @@ pub struct Me {
     pub can_exit: bool,
     pub exit_enabled: bool,
     pub last_ip: Option<String>,
+    #[serde(default)]
+    pub public_ipv4: Option<String>,
+    #[serde(default)]
+    pub public_ipv6: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +129,7 @@ pub struct ControlClient {
     /// Bumped whenever control says peers or allowlists changed, and on every
     /// presence (re)connect.
     changed: tokio::sync::watch::Sender<u64>,
+    public_ips: std::sync::Mutex<PublicIps>,
 }
 
 impl ControlClient {
@@ -129,7 +144,17 @@ impl ControlClient {
             key,
             token: Mutex::new(None),
             changed: tokio::sync::watch::Sender::new(0),
+            public_ips: std::sync::Mutex::new(PublicIps::default()),
         })
+    }
+
+    /// Reported with the next presence status.
+    pub fn set_public_ips(&self, ips: PublicIps) {
+        *self.public_ips.lock().expect("public ips poisoned") = ips;
+    }
+
+    fn public_ips(&self) -> PublicIps {
+        self.public_ips.lock().expect("public ips poisoned").clone()
     }
 
     pub fn base(&self) -> &str {
@@ -312,13 +337,13 @@ impl ControlClient {
             tokio::select! {
                 _ = ping.tick() => tx.send(Message::text("ping")).await?,
                 _ = status.tick() => {
-                    let now = (paths.snapshot(), paths.traffic());
+                    let now = (paths.snapshot(), paths.traffic(), self.public_ips());
                     let due = match &last_sent {
                         Some((prev, at)) => *prev != now || at.elapsed() >= STATUS_REFRESH,
                         None => true,
                     };
                     if due {
-                        let msg = json!({ "type": "status", "paths": now.0, "traffic": now.1 });
+                        let msg = json!({ "type": "status", "paths": now.0, "traffic": now.1, "ips": now.2 });
                         tx.send(Message::text(msg.to_string())).await?;
                         last_sent = Some((now, Instant::now()));
                     }

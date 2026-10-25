@@ -19,6 +19,32 @@ use crate::{
     proxy::ProxyClient,
 };
 
+/// Feeds control this device's public IPv4/IPv6, so the dashboard shows both
+/// families, not only the one the presence socket happens to use. The
+/// endpoint's own address list already holds what its QAD probes learned;
+/// LAN, loopback, CGNAT/Tailscale and ULA addresses are dropped.
+pub async fn report_public_ips(control: Arc<ControlClient>, endpoint: iroh::Endpoint) {
+    loop {
+        let addr = endpoint.addr();
+        let public = || {
+            addr.ip_addrs()
+                .map(|a| a.ip())
+                .filter(|ip| !crate::net::is_local(*ip))
+        };
+        control.set_public_ips(control::PublicIps {
+            v4: public().find_map(|ip| match ip {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                _ => None,
+            }),
+            v6: public().find_map(|ip| match ip {
+                std::net::IpAddr::V6(v6) => Some(v6),
+                _ => None,
+            }),
+        });
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
 /// Fallback refresh when no `peers_changed` arrives.
 const REFRESH: Duration = Duration::from_secs(30);
 

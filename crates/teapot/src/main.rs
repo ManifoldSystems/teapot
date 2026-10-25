@@ -278,6 +278,7 @@ async fn up(
     tokio::spawn(control.clone().run_presence(paths.clone()));
 
     let endpoint = teapot_core::bind(key).await?;
+    tokio::spawn(agent::report_public_ips(control.clone(), endpoint.clone()));
 
     let router = offer_exit.then(|| {
         // Next to the key: secret.key -> secret.allowlist.json
@@ -497,7 +498,13 @@ async fn status(base: &str, key: SecretKey) -> anyhow::Result<()> {
             (false, false) => "off",
         }
     );
-    println!("public ip {}", me.last_ip.as_deref().unwrap_or("-"));
+    match (&me.public_ipv4, &me.public_ipv6) {
+        (None, None) => println!("public ip {}", me.last_ip.as_deref().unwrap_or("-")),
+        (v4, v6) => {
+            println!("ipv4      {}", v4.as_deref().unwrap_or("-"));
+            println!("ipv6      {}", v6.as_deref().unwrap_or("-"));
+        }
+    }
 
     match control.peers().await {
         Ok(peers) if peers.is_empty() => println!("\nno other approved devices"),
