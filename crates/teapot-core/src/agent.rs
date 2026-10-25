@@ -163,6 +163,8 @@ pub async fn follow_exits(
     loop {
         let decision = match control.peers().await {
             Ok(peers) => {
+                // Per-request exits (proxy username) resolve against this list.
+                client.set_peers(peers.clone());
                 let current = client.exit().await.map(|id| id.to_string());
                 let my_ipv4 = control.public_ips().v4.map(|ip| ip.to_string());
                 pick_exit(
@@ -230,7 +232,7 @@ pub fn pick_exit<'a>(
     let usable = |p: &&Peer| p.exit && p.online && !same_ip(p);
 
     if let Some(wanted) = preferred {
-        match peers.iter().find(|p| matches(p, wanted)) {
+        match peers.iter().find(|p| p.matches(wanted)) {
             Some(p) if usable(&p) => return Ok(p),
             Some(p) if !p.exit => {
                 return Err(format!(
@@ -269,15 +271,6 @@ pub fn pick_exit<'a>(
         let names: Vec<String> = exits.iter().map(|p| p.label()).collect();
         format!("no exit node is online (offline: {})", names.join(", "))
     })
-}
-
-/// Name (case-insensitive), full id, or an id prefix of at least 8 chars.
-fn matches(p: &Peer, wanted: &str) -> bool {
-    p.node_id == wanted
-        || p.name
-            .as_deref()
-            .is_some_and(|n| n.eq_ignore_ascii_case(wanted))
-        || (wanted.len() >= 8 && p.node_id.starts_with(wanted))
 }
 
 #[cfg(test)]

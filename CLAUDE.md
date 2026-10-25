@@ -25,7 +25,8 @@ crates/teapot-core    agent logic, reusable by a future mobile app
                       presence WebSocket (ping, status with paths/traffic/ips)
   exit.rs             exit node: allowlist (static or live), LAN guard, byte counting
   proxy.rs            local HTTP proxy (CONNECT + absolute-form) → one iroh
-                      connection per exit, one bi-stream per TCP connection
+                      connection per exit, one bi-stream per TCP connection;
+                      exit per request via proxy username; GET /_teapot/exits
   paths.rs            per-peer path (direct/relay, rtt) and Counted<T> byte counters
   net.rs              dial with LAN/loopback/CGNAT/ULA guard on resolved IPs
   key.rs              secret key file (0600); endpoint id = public key

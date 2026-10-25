@@ -1,9 +1,15 @@
 //! Proxy client (A): a local HTTP proxy whose every TCP connection is carried
-//! to the exit node over one long-lived iroh connection.
+//! to an exit node over a long-lived iroh connection.
+//!
+//! The exit is the agent's default one, or the one named in the proxy
+//! username (`http://quantumz@127.0.0.1:1080`), which clients send as
+//! `Proxy-Authorization` — on CONNECT too, unlike custom headers that sit
+//! inside the TLS tunnel. `GET /_teapot/exits` lists what can be named.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use iroh::{
     Endpoint, EndpointId,
     endpoint::{Connection, RecvStream, SendStream},
@@ -16,7 +22,10 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::paths::{Counted, PathBook};
+use crate::{
+    control::Peer,
+    paths::{Counted, PathBook},
+};
 
 const MAX_HEAD: usize = 16 * 1024;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,6 +39,10 @@ pub struct ProxyClient {
     dial: Mutex<()>,
     paths: PathBook,
     exit_tx: tokio::sync::watch::Sender<Option<EndpointId>>,
+    /// Connections to exits named per request (not the default one).
+    explicit: Mutex<HashMap<EndpointId, Connection>>,
+    /// Latest approved peers from control, for resolving requested exits.
+    peers: std::sync::Mutex<Vec<Peer>>,
 }
 
 /// The chosen exit node and the connection to it, swapped together.
@@ -47,7 +60,70 @@ impl ProxyClient {
             dial: Mutex::new(()),
             paths,
             exit_tx: tokio::sync::watch::Sender::new(exit),
+            explicit: Mutex::new(HashMap::new()),
+            peers: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn set_peers(&self, peers: Vec<Peer>) {
+        *self.peers.lock().expect("peers poisoned") = peers;
+    }
+
+    /// A requested exit by name, id, or id prefix. It must be an enabled,
+    /// online exit: a caller who names one wants that one, not a fallback.
+    fn resolve(&self, wanted: &str) -> anyhow::Result<EndpointId> {
+        let peers = self.peers.lock().expect("peers poisoned");
+        if let Some(p) = peers.iter().find(|p| p.matches(wanted)) {
+            if !p.exit {
+                bail!("{} is not an enabled exit node", p.label());
+            }
+            if !p.online {
+                bail!("{} is offline", p.label());
+            }
+            return Ok(EndpointId::from_str(&p.node_id)?);
+        }
+        // Without control (--no-control) only full ids work.
+        EndpointId::from_str(wanted).map_err(|_| anyhow!("no exit node matches {wanted:?}"))
+    }
+
+    /// Connection to a specific exit, reusing the default one when it is the same.
+    async fn connection_to(&self, exit: EndpointId) -> anyhow::Result<Connection> {
+        if self.exit().await == Some(exit) {
+            return self.connection().await;
+        }
+        let mut conns = self.explicit.lock().await;
+        if let Some(conn) = conns.get(&exit).filter(|c| c.close_reason().is_none()) {
+            return Ok(conn.clone());
+        }
+        info!(%exit, "dialing requested exit node");
+        let conn = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(exit, ALPN_PROXY))
+            .await
+            .map_err(|_| anyhow!("exit node did not answer within {DIAL_TIMEOUT:?}"))?
+            .context("connecting to exit node")?;
+        self.paths.insert(&conn);
+        tokio::spawn(log_path_changes(conn.clone()));
+        conns.insert(exit, conn.clone());
+        Ok(conn)
+    }
+
+    /// JSON for `GET /_teapot/exits`.
+    pub async fn exits_json(&self) -> String {
+        let default = self.exit().await.map(|id| id.to_string());
+        let peers = self.peers.lock().expect("peers poisoned").clone();
+        let exits: Vec<serde_json::Value> = peers
+            .iter()
+            .filter(|p| p.exit)
+            .map(|p| {
+                serde_json::json!({
+                    "name": p.label(),
+                    "node_id": p.node_id,
+                    "online": p.online,
+                    "public_ipv4": p.public_ipv4,
+                    "default": default.as_deref() == Some(p.node_id.as_str()),
+                })
+            })
+            .collect();
+        serde_json::json!({ "exits": exits }).to_string()
     }
 
     /// Fires whenever the chosen exit node changes (including to none).
@@ -120,7 +196,19 @@ impl ProxyClient {
     /// Opens a stream to the exit node and asks it to dial `target`.
     /// Returns the streams and which exit node they go to.
     pub async fn open(&self, target: &str) -> anyhow::Result<(SendStream, RecvStream, EndpointId)> {
-        let conn = self.connection().await?;
+        self.open_via(target, None).await
+    }
+
+    /// Like [`open`](Self::open) through the named exit, or the default one.
+    pub async fn open_via(
+        &self,
+        target: &str,
+        via: Option<&str>,
+    ) -> anyhow::Result<(SendStream, RecvStream, EndpointId)> {
+        let conn = match via {
+            None => self.connection().await?,
+            Some(wanted) => self.connection_to(self.resolve(wanted)?).await?,
+        };
         let exit = conn.remote_id();
         let result = async {
             let (mut send, mut recv) = conn.open_bi().await?;
@@ -213,6 +301,21 @@ async fn handle_http(mut sock: TcpStream, client: &ProxyClient) -> anyhow::Resul
         bail!("bad request line: {request_line:?}");
     };
 
+    // Requests to the proxy itself, not through it.
+    if uri.starts_with("/_teapot/") {
+        let (status, body) = match uri {
+            "/_teapot/exits" => ("200 OK", client.exits_json().await),
+            _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+        };
+        let resp = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(resp.as_bytes()).await?;
+        return Ok(());
+    }
+    let via = requested_exit(head);
+
     // CONNECT host:port (HTTPS and anything else) tunnels raw bytes.
     // Absolute-form `GET http://host/...` (plain HTTP) is rewritten to
     // origin-form and forwarded with Connection: close.
@@ -227,7 +330,7 @@ async fn handle_http(mut sock: TcpStream, client: &ProxyClient) -> anyhow::Resul
     };
     let rest = &buf[head_end..];
 
-    let (send, recv, exit) = match client.open(&target).await {
+    let (send, recv, exit) = match client.open_via(&target, via.as_deref()).await {
         Ok(streams) => streams,
         Err(e) => {
             let body = format!("{e:#}\n");
@@ -259,6 +362,24 @@ async fn handle_http(mut sock: TcpStream, client: &ProxyClient) -> anyhow::Resul
     let (up, down) = tokio::io::copy_bidirectional(&mut sock, &mut tunnel).await?;
     debug!(%target, up, down, "closed");
     Ok(())
+}
+
+/// The exit named as the proxy username (`Proxy-Authorization: Basic
+/// base64("name:")`); the password part is ignored.
+fn requested_exit(head: &str) -> Option<String> {
+    let value = head.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("proxy-authorization")
+            .then(|| value.trim())
+    })?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = String::from_utf8(BASE64.decode(token.trim()).ok()?).ok()?;
+    let user = decoded.split(':').next()?.trim();
+    (!user.is_empty()).then(|| user.to_string())
 }
 
 /// `http://host[:port]/path?q` -> (`host:port`, `/path?q`).
@@ -294,6 +415,7 @@ fn rewrite_head(head: &str, method: &str, path: &str, version: &str) -> String {
         let name = line.split(':').next().unwrap_or_default().trim();
         if line.is_empty()
             || name.eq_ignore_ascii_case("proxy-connection")
+            || name.eq_ignore_ascii_case("proxy-authorization")
             || name.eq_ignore_ascii_case("connection")
         {
             continue;
@@ -332,8 +454,28 @@ mod tests {
     }
 
     #[test]
+    fn exit_from_proxy_username() {
+        let head =
+            |auth: &str| format!("CONNECT a:443 HTTP/1.1\r\nProxy-Authorization: {auth}\r\n\r\n");
+        // base64("quantumz:") and base64("quantumz") — both forms clients send
+        assert_eq!(
+            requested_exit(&head("Basic cXVhbnR1bXo6")).as_deref(),
+            Some("quantumz")
+        );
+        assert_eq!(
+            requested_exit(&head("basic cXVhbnR1bXo=")).as_deref(),
+            Some("quantumz")
+        );
+        assert_eq!(requested_exit(&head("Bearer xyz")), None);
+        assert_eq!(
+            requested_exit("CONNECT a:443 HTTP/1.1\r\nHost: a\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
     fn head_rewrite_drops_hop_headers() {
-        let head = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n";
+        let head = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic cXVhbnR1bXo6\r\nConnection: keep-alive\r\n\r\n";
         assert_eq!(
             rewrite_head(head, "GET", "/", "HTTP/1.1"),
             "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"

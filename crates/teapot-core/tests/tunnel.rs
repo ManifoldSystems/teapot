@@ -197,3 +197,78 @@ async fn switches_exit_and_reports_none() {
         "{res}"
     );
 }
+
+fn peer(name: &str, id: EndpointId) -> teapot_core::control::Peer {
+    teapot_core::control::Peer {
+        node_id: id.to_string(),
+        name: Some(name.into()),
+        platform: None,
+        online: true,
+        exit: true,
+        public_ipv4: None,
+    }
+}
+
+#[tokio::test]
+async fn proxy_username_picks_the_exit() {
+    let lookup = MemoryLookup::new();
+    let client_ep = endpoint(&lookup).await;
+    let (one, _r1) = exit_node(&lookup, Allow::Any, true).await;
+    let (two, _r2) = exit_node(&lookup, Allow::Any, true).await;
+    let paths = PathBook::default();
+    let (proxy_addr, client) = proxy_with(client_ep, one, paths.clone()).await;
+    client.set_peers(vec![peer("one", one), peer("two", two)]);
+    let target = target().await;
+
+    // base64("two:") — what `http://two@127.0.0.1:1080` makes clients send.
+    let res = send(
+        &proxy_addr,
+        &format!("GET http://{target}/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic dHdvOg==\r\n\r\n"),
+    )
+    .await;
+    assert!(res.ends_with("hello"), "{res}");
+    let used: Vec<String> = paths.traffic().into_iter().map(|t| t.peer).collect();
+    assert_eq!(
+        used,
+        [two.to_string()],
+        "request went through the named exit"
+    );
+
+    // No username: the default exit.
+    assert!(
+        send(
+            &proxy_addr,
+            &format!("GET http://{target}/ HTTP/1.1\r\nHost: x\r\n\r\n")
+        )
+        .await
+        .ends_with("hello")
+    );
+    assert_eq!(paths.traffic().len(), 2);
+
+    // Unknown name: 502 with the reason, never a silent fallback.
+    let res = send(
+        &proxy_addr,
+        &format!("GET http://{target}/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic bm9wZTo=\r\n\r\n"),
+    )
+    .await;
+    assert!(
+        res.starts_with("HTTP/1.1 502") && res.contains("no exit node matches"),
+        "{res}"
+    );
+
+    let listing = send(
+        &proxy_addr,
+        "GET /_teapot/exits HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    .await;
+    let body = listing.split("\r\n\r\n").nth(1).unwrap();
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    let names: Vec<&str> = json["exits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["one", "two"]);
+    assert_eq!(json["exits"][0]["default"], true);
+}
