@@ -19,7 +19,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 /// Each buyer's clone points this at their own deployment.
-pub const DEFAULT_CONTROL: &str = "https://teapot-control.sociopath-xyz.workers.dev";
+pub const DEFAULT_CONTROL: &str = "https://teapot.fannn.tech";
 
 #[derive(Parser)]
 #[command(version, about = "Personal mesh on iroh")]
