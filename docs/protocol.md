@@ -88,7 +88,7 @@ Online = the socket is open. One socket per device.
 ```
 client → "ping"                        server → "pong"
 client → {"type":"status",
-          "paths":[{"peer":<node_id>,"kind":"direct"|"relay","rtt_ms":n}],
+          "paths":[{"peer":<node_id>,"kind":"direct"|"relay","rtt_ms":n (-1 = unknown)}],
           "traffic":[{"peer":<node_id>,"tx":bytes,"rx":bytes}],
           "ips":{"v4":"a.b.c.d"?,"v6":"x:y::z"?}}
          traffic = tunnel payload since the agent started, from the sender's
