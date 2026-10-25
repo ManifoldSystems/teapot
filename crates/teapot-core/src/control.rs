@@ -137,6 +137,11 @@ impl ControlClient {
         self.key.public().to_string()
     }
 
+    /// Dashboard page where the owner confirms this device.
+    pub fn approve_url(&self) -> String {
+        format!("{}/approve/{}", self.base, self.node_id())
+    }
+
     /// Fires after `peers_changed` or a presence reconnect.
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changed.subscribe()

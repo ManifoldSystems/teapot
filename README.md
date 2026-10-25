@@ -25,7 +25,18 @@ Binary: `target/release/teapot`.
 
 ## Use
 
-On the exit node (B):
+Add each device once:
+
+```bash
+teapot login
+```
+
+It opens the control plane's approval page for this device (sign in with the
+admin token if needed), shows the device's name, platform and code, and asks
+**Add this device?** Confirm, and the command finishes on its own.
+`--no-browser` prints the link instead.
+
+On the exit node (B), then turn **exit** on for it in the dashboard:
 
 ```bash
 teapot exit
@@ -37,10 +48,9 @@ On the client (A):
 teapot proxy
 ```
 
-Both log in to control with their key and show up in the dashboard as
-**pending**. Approve both there and turn **exit** on for B. B picks up the
-allowlist immediately; A waits for approval, then picks the first online exit
-node (or name one: `teapot proxy raspi`).
+B picks up the allowlist immediately; A picks the first online exit node (or
+name one: `teapot proxy raspi`). Skipping `teapot login` works too: `exit` and
+`proxy` register the device as pending and print the approval link.
 
 Point apps at `http://127.0.0.1:1080`:
 
@@ -78,6 +88,7 @@ teapot proxy --no-control <B_ID>           # on A
 | `[EXIT]` | proxy | Exit node by name, id, or id prefix (≥ 8 chars) |
 | `--listen <addr>` | proxy | Local proxy address. Default `127.0.0.1:1080` |
 | `--no-control` | proxy | Skip control; `EXIT` must be a full id |
+| `--no-browser` | login | Print the approval link instead of opening it |
 | `RUST_LOG` | all | e.g. `teapot_core=debug` for per-stream logs |
 
 The proxy logs which path it uses (`path: relay ...` or `path: direct ...`)
@@ -91,8 +102,20 @@ crates/teapot-core    exit node, local proxy, control client, path book, key sto
 crates/teapot         CLI
 ```
 
+## Run as a service (macOS)
+
+`packaging/macos/com.manifoldsystems.teapot.plist` runs `teapot exit` with
+`RunAtLoad` and `KeepAlive`, so a Mac stays online whenever its user is logged
+in and launchd restarts it if it dies. Replace `__HOME__`, copy it to
+`~/Library/LaunchAgents/`, then load it. Logs go to `~/Library/Logs/teapot.log`.
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.manifoldsystems.teapot.plist
+launchctl kickstart -k gui/$(id -u)/com.manifoldsystems.teapot   # restart after upgrading
+```
+
 ## Not yet
 
 - SOCKS5
-- Running as a service (systemd / launchd)
+- systemd unit for Linux / Raspberry Pi
 - Switching to another exit node when the chosen one goes offline
