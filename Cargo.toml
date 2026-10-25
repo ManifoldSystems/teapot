@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/teapot-proto", "crates/teapot-core", "crates/teapot"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+teapot-proto = { path = "crates/teapot-proto" }
+teapot-core = { path = "crates/teapot-core" }
+iroh = "1.4.1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
