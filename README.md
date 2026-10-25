@@ -91,7 +91,7 @@ teapot proxy --no-control <B_ID>           # on A
 | Flag | Where | Meaning |
 |---|---|---|
 | `--key <path>` / `TEAPOT_KEY` | all | Secret key file. Default: `<config dir>/teapot/secret.key` |
-| `--control <url>` / `TEAPOT_CONTROL` | all | Control plane. Default: the deployed `teapot-control` |
+| `--control <url>` / `TEAPOT_CONTROL` | all | Control plane. Default: `https://teapot.example.com` |
 | `--name <name>` / `TEAPOT_NAME` | all | Name in the dashboard. Default: hostname |
 | `--allow <id>` | exit | Static allowlist, skips control; repeatable |
 | `--allow-any` | exit | Any endpoint, skips control. Local experiments only |
