@@ -164,8 +164,14 @@ pub async fn follow_exits(
         let decision = match control.peers().await {
             Ok(peers) => {
                 let current = client.exit().await.map(|id| id.to_string());
-                pick_exit(&peers, preferred.as_deref(), current.as_deref())
-                    .map(|p| (p.node_id.clone(), p.label()))
+                let my_ipv4 = control.public_ips().v4.map(|ip| ip.to_string());
+                pick_exit(
+                    &peers,
+                    preferred.as_deref(),
+                    current.as_deref(),
+                    my_ipv4.as_deref(),
+                )
+                .map(|p| (p.node_id.clone(), p.label()))
             }
             Err(e) if control::is_pending(&e) => {
                 Err("this device is waiting for approval".to_string())
@@ -215,8 +221,13 @@ pub fn pick_exit<'a>(
     peers: &'a [Peer],
     preferred: Option<&str>,
     current: Option<&str>,
+    my_ipv4: Option<&str>,
 ) -> Result<&'a Peer, String> {
-    let usable = |p: &&Peer| p.exit && p.online;
+    // An exit on this device's own network would leave with this device's own
+    // IP — pointless, so it counts as unusable (e.g. a laptop whose hotspot was
+    // switched off and joined the office Wi-Fi).
+    let same_ip = |p: &Peer| my_ipv4.is_some() && p.public_ipv4.as_deref() == my_ipv4;
+    let usable = |p: &&Peer| p.exit && p.online && !same_ip(p);
 
     if let Some(wanted) = preferred {
         match peers.iter().find(|p| matches(p, wanted)) {
@@ -227,7 +238,7 @@ pub fn pick_exit<'a>(
                     p.label()
                 ));
             }
-            Some(_) => {} // offline: fall back below, come back when it returns
+            Some(_) => {} // offline or same IP: fall back below, come back later
             None => return Err(format!("no approved device matches {wanted:?}")),
         }
     }
@@ -240,11 +251,23 @@ pub fn pick_exit<'a>(
         return Ok(p);
     }
 
-    let exits: Vec<String> = peers.iter().filter(|p| p.exit).map(|p| p.label()).collect();
+    let exits: Vec<&Peer> = peers.iter().filter(|p| p.exit).collect();
+    let online_same: Vec<String> = exits
+        .iter()
+        .filter(|p| p.online && same_ip(p))
+        .map(|p| p.label())
+        .collect();
     Err(if exits.is_empty() {
         "no exit nodes; turn exit on for a device in the dashboard".into()
+    } else if !online_same.is_empty() {
+        format!(
+            "every online exit leaves with this device's own IP {} ({})",
+            my_ipv4.unwrap_or("?"),
+            online_same.join(", ")
+        )
     } else {
-        format!("no exit node is online (offline: {})", exits.join(", "))
+        let names: Vec<String> = exits.iter().map(|p| p.label()).collect();
+        format!("no exit node is online (offline: {})", names.join(", "))
     })
 }
 
@@ -268,7 +291,13 @@ mod tests {
             platform: None,
             online,
             exit,
+            public_ipv4: None,
         }
+    }
+
+    fn at(mut p: Peer, ip: &str) -> Peer {
+        p.public_ipv4 = Some(ip.into());
+        p
     }
 
     #[test]
@@ -290,16 +319,24 @@ mod tests {
             peer("vps", false, true),
             peer("raspi", true, true),
         ];
-        assert_eq!(pick_exit(&peers, None, None).unwrap().label(), "raspi");
+        assert_eq!(
+            pick_exit(&peers, None, None, None).unwrap().label(),
+            "raspi"
+        );
     }
 
     #[test]
     fn by_name_or_prefix() {
         let peers = [peer("raspi", true, true), peer("vps", true, true)];
-        assert_eq!(pick_exit(&peers, Some("VPS"), None).unwrap().label(), "vps");
+        assert_eq!(
+            pick_exit(&peers, Some("VPS"), None, None).unwrap().label(),
+            "vps"
+        );
         let prefix = peers[0].node_id[..10].to_string();
         assert_eq!(
-            pick_exit(&peers, Some(&prefix), None).unwrap().label(),
+            pick_exit(&peers, Some(&prefix), None, None)
+                .unwrap()
+                .label(),
             "raspi"
         );
     }
@@ -309,7 +346,9 @@ mod tests {
         let peers = [peer("raspi", true, true), peer("vps", true, true)];
         let current = peers[1].node_id.clone();
         assert_eq!(
-            pick_exit(&peers, None, Some(&current)).unwrap().label(),
+            pick_exit(&peers, None, Some(&current), None)
+                .unwrap()
+                .label(),
             "vps"
         );
     }
@@ -320,7 +359,7 @@ mod tests {
         let raspi = peers[0].node_id.clone();
         // preferred offline -> fall back
         assert_eq!(
-            pick_exit(&peers, Some("raspi"), Some(&raspi))
+            pick_exit(&peers, Some("raspi"), Some(&raspi), None)
                 .unwrap()
                 .label(),
             "vps"
@@ -329,7 +368,7 @@ mod tests {
         peers[0].online = true;
         let vps = peers[1].node_id.clone();
         assert_eq!(
-            pick_exit(&peers, Some("raspi"), Some(&vps))
+            pick_exit(&peers, Some("raspi"), Some(&vps), None)
                 .unwrap()
                 .label(),
             "raspi"
@@ -337,15 +376,50 @@ mod tests {
     }
 
     #[test]
+    fn skips_exits_with_own_ip() {
+        let office = "192.0.2.10";
+        let peers = [
+            at(peer("phone-exit", true, true), office), // hotspot off, now on office Wi-Fi
+            at(peer("office-exit", true, true), office),
+            at(peer("home-exit", true, true), "198.51.100.20"),
+        ];
+        let got = pick_exit(&peers, Some("phone-exit"), None, Some(office)).unwrap();
+        assert_eq!(got.label(), "home-exit");
+        // Hotspot back on: phone-exit differs again and wins as the preferred one.
+        let peers = [
+            at(peer("phone-exit", true, true), "203.0.113.30"),
+            peers[2].clone(),
+        ];
+        let got = pick_exit(&peers, Some("phone-exit"), None, Some(office)).unwrap();
+        assert_eq!(got.label(), "phone-exit");
+    }
+
+    #[test]
+    fn unknown_ips_never_exclude() {
+        let peers = [peer("phone-exit", true, true)];
+        assert!(pick_exit(&peers, None, None, Some("192.0.2.10")).is_ok());
+        let peers = [at(peer("phone-exit", true, true), "192.0.2.10")];
+        assert!(pick_exit(&peers, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn explains_same_ip() {
+        let office = "192.0.2.10";
+        let peers = [at(peer("office-exit", true, true), office)];
+        let err = pick_exit(&peers, None, None, Some(office)).unwrap_err();
+        assert!(err.contains("own IP 192.0.2.10 (office-exit)"), "{err}");
+    }
+
+    #[test]
     fn explains_why_not() {
         let peers = [peer("laptop", true, false), peer("vps", false, true)];
-        let err = pick_exit(&peers, Some("laptop"), None).unwrap_err();
+        let err = pick_exit(&peers, Some("laptop"), None, None).unwrap_err();
         assert!(err.contains("not an enabled exit node"), "{err}");
-        let err = pick_exit(&peers, None, None).unwrap_err();
+        let err = pick_exit(&peers, None, None, None).unwrap_err();
         assert!(err.contains("offline: vps"), "{err}");
-        let err = pick_exit(&peers[..1], None, None).unwrap_err();
+        let err = pick_exit(&peers[..1], None, None, None).unwrap_err();
         assert!(err.contains("no exit nodes"), "{err}");
-        let err = pick_exit(&peers, Some("nope"), None).unwrap_err();
+        let err = pick_exit(&peers, Some("nope"), None, None).unwrap_err();
         assert!(err.contains("no approved device"), "{err}");
     }
 }

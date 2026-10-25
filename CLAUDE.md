@@ -109,6 +109,8 @@ running (see teapot-control CLAUDE.md).
   string; write the list inline or use an array. `path` is a zsh special
   (tied to `PATH`) — never use it as a variable name.
 - `curl` ignores the macOS system proxy; browsers follow it.
+- Exit choice skips peers whose reported IPv4 equals this device's own (same
+  network → same IP → pointless). Unknown IPs never exclude.
 - `--system-proxy` changes macOS network settings — do not run it on the
   owner's machines without them; they test it.
 

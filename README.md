@@ -38,9 +38,11 @@ teapot service install    # runs `teapot up` in the background, restarts it if i
   device in the dashboard (`--no-exit` to never offer it);
 - **local proxy** on `127.0.0.1:1080` — exits through another device: the one
   named with `--exit <name>` while it is online, otherwise any online exit
-  node. When the current exit goes offline the proxy moves to another one
-  within a few seconds and comes back to `--exit` when it returns
-  (`--no-proxy` to skip the proxy).
+  node. When the current exit goes offline — or turns out to leave with this
+  device's own public IPv4, e.g. a laptop whose hotspot was switched off and
+  joined the same Wi-Fi — the proxy moves to another one within seconds and
+  comes back to `--exit` when it is useful again (`--no-proxy` to skip the
+  proxy).
 
 Options given to `teapot service install` are passed to `up`, e.g.
 `teapot service install --exit phone-exit`. `teapot service status` and

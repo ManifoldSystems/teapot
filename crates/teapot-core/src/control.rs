@@ -93,6 +93,9 @@ pub struct Peer {
     pub platform: Option<String>,
     pub online: bool,
     pub exit: bool,
+    /// Where traffic through this peer leaves, as the peer reported it.
+    #[serde(default)]
+    pub public_ipv4: Option<String>,
 }
 
 impl Peer {
@@ -148,12 +151,17 @@ impl ControlClient {
         })
     }
 
-    /// Reported with the next presence status.
+    /// Reported with the next presence status. A new IPv4 means this device
+    /// moved networks, so exit choices are re-evaluated right away.
     pub fn set_public_ips(&self, ips: PublicIps) {
-        *self.public_ips.lock().expect("public ips poisoned") = ips;
+        let mut current = self.public_ips.lock().expect("public ips poisoned");
+        if current.v4 != ips.v4 {
+            self.changed.send_modify(|n| *n += 1);
+        }
+        *current = ips;
     }
 
-    fn public_ips(&self) -> PublicIps {
+    pub fn public_ips(&self) -> PublicIps {
         self.public_ips.lock().expect("public ips poisoned").clone()
     }
 
