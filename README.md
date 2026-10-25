@@ -25,32 +25,30 @@ Binary: `target/release/teapot`.
 
 ## Use
 
-Add each device once:
+On every device, once:
 
 ```bash
-teapot login
+teapot login              # opens the approval page; confirm "Add this device?"
+teapot service install    # runs `teapot up` in the background, restarts it if it dies
 ```
 
-It opens the control plane's approval page for this device (sign in with the
-admin token if needed), shows the device's name, platform and code, and asks
-**Add this device?** Confirm, and the command finishes on its own.
-`--no-browser` prints the link instead.
+`teapot up` keeps one endpoint online and does two jobs:
 
-On the exit node (B), then turn **exit** on for it in the dashboard:
+- **exit node** — serves other devices once you turn **exit** on for this
+  device in the dashboard (`--no-exit` to never offer it);
+- **local proxy** on `127.0.0.1:1080` — exits through another device: the one
+  named with `--exit <name>` while it is online, otherwise any online exit
+  node. When the current exit goes offline the proxy moves to another one
+  within a few seconds and comes back to `--exit` when it returns
+  (`--no-proxy` to skip the proxy).
 
-```bash
-teapot exit
-```
+Options given to `teapot service install` are passed to `up`, e.g.
+`teapot service install --exit quantumz`. `teapot service status` and
+`teapot service uninstall` do what they say. macOS uses a launchd agent
+(runs while you are logged in); Linux uses a systemd user unit (add
+`sudo loginctl enable-linger $USER` to run without a login session).
 
-On the client (A):
-
-```bash
-teapot proxy
-```
-
-B picks up the allowlist immediately; A picks the first online exit node (or
-name one: `teapot proxy raspi`). Skipping `teapot login` works too: `exit` and
-`proxy` register the device as pending and print the approval link.
+`teapot exit` and `teapot proxy` are `up --no-proxy` and `up --no-exit`.
 
 Point apps at `http://127.0.0.1:1080`:
 
@@ -85,7 +83,8 @@ teapot proxy --no-control <B_ID>           # on A
 | `--allow <id>` | exit | Static allowlist, skips control; repeatable |
 | `--allow-any` | exit | Any endpoint, skips control. Local experiments only |
 | `--allow-lan` | exit | Let clients reach B's loopback and LAN. Off by default |
-| `[EXIT]` | proxy | Exit node by name, id, or id prefix (≥ 8 chars) |
+| `--exit <name>` / `[EXIT]` | up / proxy | Preferred exit node by name, id, or id prefix (≥ 8 chars) |
+| `--no-proxy` / `--no-exit` | up | Skip the local proxy / never offer exit |
 | `--listen <addr>` | proxy | Local proxy address. Default `127.0.0.1:1080` |
 | `--no-control` | proxy | Skip control; `EXIT` must be a full id |
 | `--no-browser` | login | Print the approval link instead of opening it |
@@ -98,24 +97,12 @@ whenever it changes, and every device reports its paths to the dashboard.
 
 ```
 crates/teapot-proto   wire format, ALPN; see docs/protocol.md
-crates/teapot-core    exit node, local proxy, control client, path book, key storage, LAN guard
-crates/teapot         CLI
-```
-
-## Run as a service (macOS)
-
-`packaging/macos/com.manifoldsystems.teapot.plist` runs `teapot exit` with
-`RunAtLoad` and `KeepAlive`, so a Mac stays online whenever its user is logged
-in and launchd restarts it if it dies. Replace `__HOME__`, copy it to
-`~/Library/LaunchAgents/`, then load it. Logs go to `~/Library/Logs/teapot.log`.
-
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.manifoldsystems.teapot.plist
-launchctl kickstart -k gui/$(id -u)/com.manifoldsystems.teapot   # restart after upgrading
+crates/teapot-core    exit node, local proxy, control client, exit selection, path book, key, LAN guard
+                      tests/tunnel.rs: exit + proxy in one process, no relay or DNS
+crates/teapot         CLI, service install (launchd / systemd)
 ```
 
 ## Not yet
 
 - SOCKS5
-- systemd unit for Linux / Raspberry Pi
-- Switching to another exit node when the chosen one goes offline
+- systemd unit tested on a real Linux box / Raspberry Pi (written, not yet run)

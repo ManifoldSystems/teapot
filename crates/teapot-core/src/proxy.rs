@@ -19,43 +19,94 @@ use tracing::{debug, info, warn};
 use crate::paths::PathBook;
 
 const MAX_HEAD: usize = 16 * 1024;
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ProxyClient {
     endpoint: Endpoint,
-    exit: EndpointId,
-    conn: Mutex<Option<Connection>>,
+    /// Held only briefly, never across a dial, so switching exit nodes is
+    /// never stuck behind a dial to one that just went away.
+    state: Mutex<State>,
+    /// One dial at a time; concurrent requests wait for it and share the result.
+    dial: Mutex<()>,
     paths: PathBook,
 }
 
+/// The chosen exit node and the connection to it, swapped together.
+#[derive(Default)]
+struct State {
+    exit: Option<EndpointId>,
+    conn: Option<Connection>,
+}
+
 impl ProxyClient {
-    pub fn new(endpoint: Endpoint, exit: EndpointId, paths: PathBook) -> Self {
+    pub fn new(endpoint: Endpoint, exit: Option<EndpointId>, paths: PathBook) -> Self {
         Self {
             endpoint,
-            exit,
-            conn: Mutex::new(None),
+            state: Mutex::new(State { exit, conn: None }),
+            dial: Mutex::new(()),
             paths,
         }
     }
 
+    pub async fn exit(&self) -> Option<EndpointId> {
+        self.state.lock().await.exit
+    }
+
+    /// Points new streams at another exit node (or none). Streams on the old
+    /// connection are cut. Returns whether anything changed.
+    pub async fn set_exit(&self, exit: Option<EndpointId>) -> bool {
+        let mut state = self.state.lock().await;
+        if state.exit == exit {
+            return false;
+        }
+        if let Some(old) = state.conn.take() {
+            old.close(0u32.into(), b"switching exit node");
+        }
+        state.exit = exit;
+        true
+    }
+
     /// Returns the live connection to the exit node, redialing if it closed.
     pub async fn connection(&self) -> anyhow::Result<Connection> {
-        let mut slot = self.conn.lock().await;
-        if let Some(conn) = slot.as_ref()
-            && conn.close_reason().is_none()
-        {
-            return Ok(conn.clone());
+        if let Some(conn) = self.live().await? {
+            return Ok(conn);
         }
-        info!(exit = %self.exit, "dialing exit node");
-        let conn = self
-            .endpoint
-            .connect(self.exit, ALPN_PROXY)
+        let _dialing = self.dial.lock().await;
+        // Someone may have dialed while we waited.
+        if let Some(conn) = self.live().await? {
+            return Ok(conn);
+        }
+        let exit = self.exit().await.context("no exit node online")?;
+
+        info!(%exit, "dialing exit node");
+        let conn = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(exit, ALPN_PROXY))
             .await
+            .map_err(|_| anyhow::anyhow!("exit node did not answer within {DIAL_TIMEOUT:?}"))?
             .context("connecting to exit node")?;
-        info!(exit = %self.exit, "connected");
+
+        let mut state = self.state.lock().await;
+        if state.exit != Some(exit) {
+            conn.close(0u32.into(), b"switching exit node");
+            bail!("exit node changed while dialing; retry");
+        }
+        info!(%exit, "connected");
         self.paths.insert(&conn);
         tokio::spawn(log_path_changes(conn.clone()));
-        *slot = Some(conn.clone());
+        state.conn = Some(conn.clone());
         Ok(conn)
+    }
+
+    /// The open connection, if any; errors when no exit node is chosen.
+    async fn live(&self) -> anyhow::Result<Option<Connection>> {
+        let state = self.state.lock().await;
+        if state.exit.is_none() {
+            bail!("no exit node online");
+        }
+        Ok(state
+            .conn
+            .as_ref()
+            .filter(|c| c.close_reason().is_none())
+            .cloned())
     }
 
     /// Opens a stream to the exit node and asks it to dial `target`.
@@ -112,6 +163,10 @@ pub async fn serve(listen: SocketAddr, client: Arc<ProxyClient>) -> anyhow::Resu
         .await
         .with_context(|| format!("binding {listen}"))?;
     info!("HTTP proxy listening on {listen}");
+    serve_listener(listener, client).await
+}
+
+pub async fn serve_listener(listener: TcpListener, client: Arc<ProxyClient>) -> anyhow::Result<()> {
     loop {
         let (sock, from) = listener.accept().await?;
         let client = client.clone();

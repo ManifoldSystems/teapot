@@ -1,5 +1,6 @@
 //! Agent logic shared by the `teapot` binary and, later, the mobile app.
 
+pub mod agent;
 pub mod control;
 pub mod exit;
 pub mod key;

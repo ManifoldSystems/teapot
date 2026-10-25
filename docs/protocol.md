@@ -71,7 +71,7 @@ POST /v1/auth/verify {node_id, challenge, signature}
 | Method | Path | Body / result |
 |---|---|---|
 | GET | `/v1/devices/me` | device row |
-| PUT | `/v1/devices/me` | `{name?, platform?, can_exit?}`; omitted fields are kept, `can_exit: false` also turns exit off |
+| PUT | `/v1/devices/me` | `{name?, platform?, can_exit?}`; omitted fields are kept. `can_exit` = the device serves exit right now; the owner's exit toggle is stored separately and survives restarts |
 | GET | `/v1/peers` | `[{node_id, name, platform, online, exit}]`; `403 PENDING` until approved |
 | GET | `/v1/exit/allowlist` | `{exit_enabled, allow: [node_id]}`; `403 PENDING` until approved |
 | GET | `/v1/presence` | WebSocket upgrade; token as Bearer or `?token=` |
@@ -85,7 +85,8 @@ Online = the socket is open. One socket per device.
 ```
 client → "ping"                        server → "pong"
 client → {"type":"status","paths":[{"peer":<node_id>,"kind":"direct"|"relay","rtt_ms":n}]}
-server → {"type":"peers_changed"}      refetch /v1/peers and /v1/exit/allowlist
+server → {"type":"peers_changed"}      approval, exit, or online state changed:
+                                       refetch /v1/peers and /v1/exit/allowlist
 close 4000  replaced by a newer connection of the same device
 close 4001  removed or revoked from the dashboard
 ```
