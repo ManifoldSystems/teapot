@@ -42,6 +42,13 @@ struct Cli {
 enum Cmd {
     /// Print this device's endpoint id.
     Id,
+    /// Add this device to your mesh: opens the approval page in a browser
+    /// and waits until you confirm.
+    Login {
+        /// Print the link instead of opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// Log in to control and show this device and its peers.
     Status,
     /// Act as an exit node: dial the internet for allowed clients.
@@ -94,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Id => println!("{}", secret_key.public()),
+        Cmd::Login { no_browser } => login(&cli, secret_key, no_browser).await?,
         Cmd::Status => status(&cli.control, secret_key).await?,
         Cmd::Exit {
             ref allow,
@@ -190,9 +198,9 @@ async fn join_control(
         info!(%name, "logged in to control");
     } else {
         warn!(
-            "{name} ({}) is waiting for approval at {}",
+            "{name} ({}) is waiting for approval; run `teapot login` or open {}",
             &control.node_id()[..8],
-            control.base()
+            control.approve_url()
         );
     }
     Ok(control)
@@ -301,6 +309,66 @@ async fn sync_allowlist(control: Arc<ControlClient>, tx: watch::Sender<HashSet<E
             _ = changed.changed() => {}
             _ = tokio::time::sleep(Duration::from_secs(60)) => {}
         }
+    }
+}
+
+async fn login(cli: &Cli, key: SecretKey, no_browser: bool) -> anyhow::Result<()> {
+    let control = ControlClient::new(&cli.control, key)?;
+    let status = control
+        .login()
+        .await
+        .with_context(|| format!("logging in to {}", control.base()))?;
+    let name = device_name(cli);
+    control
+        .update_me(&DeviceInfo {
+            name: Some(name.clone()),
+            platform: Some(std::env::consts::OS.into()),
+            can_exit: None,
+        })
+        .await?;
+    if status == "approved" {
+        println!("{name} is already in your mesh.");
+        return Ok(());
+    }
+
+    let url = control.approve_url();
+    println!("To add {name} to your mesh, open:\n\n  {url}\n");
+    println!(
+        "Check that the page shows code {}.\n",
+        &control.node_id()[..8]
+    );
+    if !no_browser && let Err(e) = open_browser(&url) {
+        println!("(could not open a browser: {e}; open the link yourself)\n");
+    }
+
+    println!("Waiting for approval… (Ctrl+C to stop)");
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match control.me().await {
+            Ok(me) if me.status == "approved" => break,
+            Ok(_) => {}
+            Err(e) => warn!("{e:#}"),
+        }
+    }
+    println!("✓ {name} added. Run `teapot exit` or `teapot proxy` on it.");
+    Ok(())
+}
+
+fn open_browser(url: &str) -> std::io::Result<()> {
+    let mut cmd = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    let status = cmd.arg(url).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("exit status {status}")))
     }
 }
 
