@@ -1,7 +1,13 @@
 //! Long-running agent tasks that keep a device in step with control: joining,
 //! the exit node's allowlist, and the proxy's choice of exit node.
 
-use std::{collections::HashSet, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use iroh::{EndpointId, SecretKey};
@@ -44,9 +50,18 @@ pub async fn join(
 
 /// Keeps an exit node's allowlist equal to control's. Refetches on every
 /// `peers_changed` and every 30 s.
-pub async fn sync_allowlist(control: Arc<ControlClient>, tx: watch::Sender<HashSet<EndpointId>>) {
+///
+/// Each new list is written to `cache`, so a restart while control is
+/// unreachable starts from the last known list instead of refusing everyone
+/// (see [`load_allowlist`]).
+pub async fn sync_allowlist(
+    control: Arc<ControlClient>,
+    tx: watch::Sender<HashSet<EndpointId>>,
+    cache: Option<PathBuf>,
+) {
     let mut changed = control.subscribe();
     let mut enabled: Option<bool> = None;
+    let mut cached_once = false;
     loop {
         match control.allowlist().await {
             Ok(list) => {
@@ -65,20 +80,48 @@ pub async fn sync_allowlist(control: Arc<ControlClient>, tx: watch::Sender<HashS
                     .iter()
                     .filter_map(|id| EndpointId::from_str(id).ok())
                     .collect();
-                tx.send_if_modified(|current| {
+                let changed_now = tx.send_if_modified(|current| {
                     if *current == set {
                         return false;
                     }
                     info!(clients = set.len(), "allowlist updated");
-                    *current = set;
+                    *current = set.clone();
                     true
                 });
+                if (changed_now || !cached_once)
+                    && let Some(path) = &cache
+                {
+                    match save_allowlist(path, &set) {
+                        Ok(()) => cached_once = true,
+                        Err(e) => warn!("caching allowlist: {e:#}"),
+                    }
+                }
             }
             Err(e) if control::is_pending(&e) => {}
             Err(e) => warn!("allowlist: {e:#}"),
         }
         wait_for_change(&mut changed).await;
     }
+}
+
+/// The allowlist cached by [`sync_allowlist`], if any.
+pub fn load_allowlist(path: &Path) -> Option<HashSet<EndpointId>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let ids: Vec<String> = serde_json::from_str(&text).ok()?;
+    Some(
+        ids.iter()
+            .filter_map(|id| EndpointId::from_str(id).ok())
+            .collect(),
+    )
+}
+
+fn save_allowlist(path: &Path, set: &HashSet<EndpointId>) -> anyhow::Result<()> {
+    let mut ids: Vec<String> = set.iter().map(|id| id.to_string()).collect();
+    ids.sort();
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&ids)?)?;
+    std::fs::rename(&tmp, path)?; // atomic: never a half-written list
+    Ok(())
 }
 
 /// Keeps the proxy pointed at a usable exit node: the preferred one when it
@@ -200,6 +243,18 @@ mod tests {
             online,
             exit,
         }
+    }
+
+    #[test]
+    fn allowlist_cache_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("teapot-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.json");
+        let set: HashSet<EndpointId> = (0..3).map(|_| SecretKey::generate().public()).collect();
+        save_allowlist(&path, &set).unwrap();
+        assert_eq!(load_allowlist(&path), Some(set));
+        assert_eq!(load_allowlist(&dir.join("missing.json")), None);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

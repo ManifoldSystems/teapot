@@ -3007,6 +3007,8 @@ dependencies = [
  "hostname",
  "iroh",
  "rustls",
+ "serde",
+ "serde_json",
  "teapot-core",
  "teapot-proto",
  "tokio",

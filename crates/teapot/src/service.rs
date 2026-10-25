@@ -47,6 +47,9 @@ fn up_args(args: &UpArgs) -> Vec<String> {
     if args.allow_lan {
         out.push("--allow-lan".into());
     }
+    if args.system_proxy {
+        out.push("--system-proxy".into());
+    }
     out
 }
 
@@ -66,7 +69,13 @@ pub fn install(global: &[String], args: &UpArgs) -> anyhow::Result<()> {
 }
 
 pub fn uninstall() -> anyhow::Result<()> {
-    platform::uninstall()
+    platform::uninstall()?;
+    // A stopped service must not leave the Mac pointing at a dead proxy.
+    if crate::sysproxy::is_enabled() {
+        crate::sysproxy::disable()?;
+        println!("System proxy restored.");
+    }
+    Ok(())
 }
 
 pub fn status() -> anyhow::Result<()> {
@@ -324,6 +333,7 @@ mod tests {
             no_proxy: false,
             no_exit: false,
             allow_lan: false,
+            system_proxy: false,
         }
     }
 

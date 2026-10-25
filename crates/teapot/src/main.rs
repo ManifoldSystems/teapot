@@ -1,8 +1,7 @@
 mod service;
+mod sysproxy;
 
-use std::{
-    collections::HashSet, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc, time::Duration,
-};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
@@ -62,6 +61,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
+    /// Inspect or undo the macOS system proxy set by `up --system-proxy`.
+    SystemProxy {
+        #[command(subcommand)]
+        cmd: SystemProxyCmd,
+    },
     /// Only serve as an exit node (same as `up --no-proxy`).
     ///
     /// --allow / --allow-any skip control and use a static allowlist.
@@ -106,6 +110,18 @@ pub struct UpArgs {
     /// Let exit clients reach this machine's LAN and loopback.
     #[arg(long)]
     allow_lan: bool,
+    /// macOS: point the system HTTP/HTTPS proxy at the local proxy while an
+    /// exit node is available, and restore it otherwise and on shutdown.
+    #[arg(long, conflicts_with = "no_proxy")]
+    system_proxy: bool,
+}
+
+#[derive(Subcommand)]
+enum SystemProxyCmd {
+    /// Restore the settings teapot replaced.
+    Off,
+    /// Say whether teapot currently owns the system proxy.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -132,6 +148,24 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    if let Cmd::SystemProxy { cmd } = &cli.cmd {
+        match cmd {
+            SystemProxyCmd::Off => {
+                sysproxy::disable()?;
+                println!("System proxy restored.");
+            }
+            SystemProxyCmd::Status => println!(
+                "{}",
+                if sysproxy::is_enabled() {
+                    "teapot owns the system proxy (`teapot system-proxy off` restores it)"
+                } else {
+                    "system proxy untouched by teapot"
+                }
+            ),
+        }
+        return Ok(());
+    }
+
     // Service management never touches the key or the network.
     if let Cmd::Service { cmd } = &cli.cmd {
         return match cmd {
@@ -157,8 +191,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Id => println!("{}", secret_key.public()),
         Cmd::Login { no_browser } => login(&cli, secret_key, *no_browser).await?,
         Cmd::Status => status(&cli.control, secret_key).await?,
-        Cmd::Service { .. } => unreachable!("handled above"),
-        Cmd::Up(args) => up(&cli, secret_key, args.clone()).await?,
+        Cmd::Service { .. } | Cmd::SystemProxy { .. } => unreachable!("handled above"),
+        Cmd::Up(args) => up(&cli, secret_key, &key_path, args.clone()).await?,
         Cmd::Exit {
             allow,
             allow_any,
@@ -178,8 +212,9 @@ async fn main() -> anyhow::Result<()> {
                     no_proxy: true,
                     no_exit: false,
                     allow_lan: *allow_lan,
+                    system_proxy: false,
                 };
-                up(&cli, secret_key, args).await?;
+                up(&cli, secret_key, &key_path, args).await?;
             }
         }
         Cmd::Proxy {
@@ -200,8 +235,9 @@ async fn main() -> anyhow::Result<()> {
                     no_proxy: false,
                     no_exit: true,
                     allow_lan: false,
+                    system_proxy: false,
                 };
-                up(&cli, secret_key, args).await?;
+                up(&cli, secret_key, &key_path, args).await?;
             }
         }
     }
@@ -219,7 +255,12 @@ fn device_name(cli: &Cli) -> String {
 }
 
 /// One endpoint, one presence socket: exit node and proxy side by side.
-async fn up(cli: &Cli, key: SecretKey, args: UpArgs) -> anyhow::Result<()> {
+async fn up(
+    cli: &Cli,
+    key: SecretKey,
+    key_path: &std::path::Path,
+    args: UpArgs,
+) -> anyhow::Result<()> {
     let offer_exit = !args.no_exit;
     let run_proxy = !args.no_proxy;
     let paths = PathBook::default();
@@ -239,8 +280,14 @@ async fn up(cli: &Cli, key: SecretKey, args: UpArgs) -> anyhow::Result<()> {
     let endpoint = teapot_core::bind(key).await?;
 
     let router = offer_exit.then(|| {
-        let (tx, rx) = watch::channel(HashSet::new());
-        tokio::spawn(agent::sync_allowlist(control.clone(), tx));
+        // Next to the key: secret.key -> secret.allowlist.json
+        let cache = key_path.with_extension("allowlist.json");
+        let start = agent::load_allowlist(&cache).unwrap_or_default();
+        if !start.is_empty() {
+            info!(clients = start.len(), "starting from cached allowlist");
+        }
+        let (tx, rx) = watch::channel(start);
+        tokio::spawn(agent::sync_allowlist(control.clone(), tx, Some(cache)));
         let policy = ExitPolicy {
             allow: Allow::Live(rx),
             allow_lan: args.allow_lan,
@@ -252,6 +299,11 @@ async fn up(cli: &Cli, key: SecretKey, args: UpArgs) -> anyhow::Result<()> {
 
     let proxy_task = if run_proxy {
         let client = Arc::new(ProxyClient::new(endpoint.clone(), None, paths.clone()));
+        if args.system_proxy {
+            // Undo whatever a crashed run left behind before deciding anew.
+            sysproxy::disable()?;
+            tokio::spawn(follow_system_proxy(client.watch_exit(), args.listen));
+        }
         tokio::spawn(agent::follow_exits(
             control.clone(),
             client.clone(),
@@ -270,19 +322,65 @@ async fn up(cli: &Cli, key: SecretKey, args: UpArgs) -> anyhow::Result<()> {
         "teapot is up"
     );
 
-    match proxy_task {
+    let result = match proxy_task {
         Some(task) => tokio::select! {
-            res = task => res??,
-            _ = tokio::signal::ctrl_c() => {}
+            res = task => res.map_err(anyhow::Error::from).and_then(|r| r),
+            _ = shutdown_signal() => Ok(()),
         },
-        None => tokio::signal::ctrl_c().await?,
+        None => {
+            shutdown_signal().await;
+            Ok(())
+        }
+    };
+    if args.system_proxy
+        && let Err(e) = sysproxy::disable()
+    {
+        warn!("restoring system proxy: {e:#}");
     }
+    result?;
 
     if let Some(router) = router {
         router.shutdown().await?;
     }
     endpoint.close().await;
     Ok(())
+}
+
+/// Ctrl+C, or SIGTERM from launchd/systemd stopping the service.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// System proxy on only while an exit node is chosen, so having no exit
+/// never cuts this machine off the internet.
+async fn follow_system_proxy(mut exit: watch::Receiver<Option<EndpointId>>, listen: SocketAddr) {
+    loop {
+        let has_exit = exit.borrow_and_update().is_some();
+        let res = if has_exit {
+            sysproxy::enable(listen)
+        } else {
+            sysproxy::disable()
+        };
+        match res {
+            Ok(()) => info!(on = has_exit, "system proxy"),
+            Err(e) => warn!("system proxy: {e:#}"),
+        }
+        if exit.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn static_exit(key: SecretKey, allow: Allow, allow_lan: bool) -> anyhow::Result<()> {

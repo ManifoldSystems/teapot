@@ -13,7 +13,7 @@ use tokio::{sync::Mutex, time::Instant};
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest, http::HeaderValue};
 use tracing::{debug, info, warn};
 
-use crate::paths::{PathBook, PeerPath};
+use crate::paths::{PathBook, PeerPath, PeerTraffic};
 
 /// Cloudflare rejects library-default user agents (error 1010), so always
 /// identify ourselves.
@@ -24,6 +24,9 @@ const STATUS_EVERY: Duration = Duration::from_secs(5);
 /// Re-send an unchanged status this often so the dashboard never goes stale.
 const STATUS_REFRESH: Duration = Duration::from_secs(60);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// What the presence status message carries.
+type Report = (Vec<PeerPath>, Vec<PeerTraffic>);
 
 #[derive(Debug, Deserialize)]
 struct Envelope<T> {
@@ -303,19 +306,19 @@ impl ControlClient {
         let (mut tx, mut rx) = ws.split();
         let mut ping = tokio::time::interval(PING_EVERY);
         let mut status = tokio::time::interval(STATUS_EVERY);
-        let mut last_sent: Option<(Vec<PeerPath>, Instant)> = None;
+        let mut last_sent: Option<(Report, Instant)> = None;
 
         loop {
             tokio::select! {
                 _ = ping.tick() => tx.send(Message::text("ping")).await?,
                 _ = status.tick() => {
-                    let now = paths.snapshot();
+                    let now = (paths.snapshot(), paths.traffic());
                     let due = match &last_sent {
                         Some((prev, at)) => *prev != now || at.elapsed() >= STATUS_REFRESH,
                         None => true,
                     };
                     if due {
-                        let msg = json!({ "type": "status", "paths": now });
+                        let msg = json!({ "type": "status", "paths": now.0, "traffic": now.1 });
                         tx.send(Message::text(msg.to_string())).await?;
                         last_sent = Some((now, Instant::now()));
                     }

@@ -1,13 +1,20 @@
-//! Which path (direct or relay) each live iroh connection is using, for the
-//! presence report.
+//! Per-peer view of live iroh connections for the presence report: which path
+//! (direct or relay) each uses, and how many tunnel bytes went each way.
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    io,
+    pin::Pin,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
 };
 
 use iroh::{EndpointId, endpoint::Connection};
 use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PeerPath {
@@ -16,23 +23,55 @@ pub struct PeerPath {
     pub rtt_ms: u64,
 }
 
-/// Live connections by peer. Closed connections drop out on the next snapshot,
-/// so callers only ever insert.
+/// Tunnel payload since this process started, from this device's side:
+/// `tx` went to the peer, `rx` came from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PeerTraffic {
+    pub peer: String,
+    pub tx: u64,
+    pub rx: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct Counter {
+    tx: AtomicU64,
+    rx: AtomicU64,
+}
+
+impl Counter {
+    /// Bytes sent to the peer that never passed through a [`Counted`] socket.
+    pub fn add_tx(&self, n: usize) {
+        self.tx.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    conns: HashMap<EndpointId, Connection>,
+    traffic: HashMap<EndpointId, Arc<Counter>>,
+}
+
+/// Live connections and byte counters by peer. Closed connections drop out on
+/// the next snapshot, so callers only ever insert.
 #[derive(Debug, Clone, Default)]
-pub struct PathBook(Arc<Mutex<HashMap<EndpointId, Connection>>>);
+pub struct PathBook(Arc<Mutex<Inner>>);
 
 impl PathBook {
     pub fn insert(&self, conn: &Connection) {
-        self.0
-            .lock()
-            .expect("path book poisoned")
-            .insert(conn.remote_id(), conn.clone());
+        self.lock().conns.insert(conn.remote_id(), conn.clone());
+    }
+
+    /// Counter for tunnels with `peer`; wrap the local TCP side with
+    /// [`Counted`] to feed it.
+    pub fn counter(&self, peer: EndpointId) -> Arc<Counter> {
+        self.lock().traffic.entry(peer).or_default().clone()
     }
 
     pub fn snapshot(&self) -> Vec<PeerPath> {
-        let mut map = self.0.lock().expect("path book poisoned");
-        map.retain(|_, conn| conn.close_reason().is_none());
-        let mut out: Vec<PeerPath> = map
+        let mut inner = self.lock();
+        inner.conns.retain(|_, conn| conn.close_reason().is_none());
+        let mut out: Vec<PeerPath> = inner
+            .conns
             .iter()
             .filter_map(|(peer, conn)| {
                 let paths = conn.paths();
@@ -46,5 +85,102 @@ impl PathBook {
             .collect();
         out.sort_by(|a, b| a.peer.cmp(&b.peer));
         out
+    }
+
+    pub fn traffic(&self) -> Vec<PeerTraffic> {
+        let mut out: Vec<PeerTraffic> = self
+            .lock()
+            .traffic
+            .iter()
+            .map(|(peer, c)| PeerTraffic {
+                peer: peer.to_string(),
+                tx: c.tx.load(Ordering::Relaxed),
+                rx: c.rx.load(Ordering::Relaxed),
+            })
+            .filter(|t| t.tx > 0 || t.rx > 0)
+            .collect();
+        out.sort_by(|a, b| a.peer.cmp(&b.peer));
+        out
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.0.lock().expect("path book poisoned")
+    }
+}
+
+/// The local end of a tunnel (the TCP socket), counting as it goes: bytes
+/// read from it head to the peer (`tx`), bytes written to it came from the
+/// peer (`rx`).
+pub struct Counted<T> {
+    inner: T,
+    counter: Arc<Counter>,
+}
+
+impl<T> Counted<T> {
+    pub fn new(inner: T, counter: Arc<Counter>) -> Self {
+        Self { inner, counter }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Counted<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let n = (buf.filled().len() - before) as u64;
+        self.counter.tx.fetch_add(n, Ordering::Relaxed);
+        res
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Counted<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res {
+            self.counter.rx.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh::SecretKey;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn counts_both_directions() {
+        let book = PathBook::default();
+        let peer = SecretKey::generate().public();
+        let (a, mut b) = tokio::io::duplex(64);
+        let mut counted = Counted::new(a, book.counter(peer));
+
+        counted.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        b.read_exact(&mut buf).await.unwrap();
+        b.write_all(b"hi!").await.unwrap();
+        let mut buf = [0u8; 3];
+        counted.read_exact(&mut buf).await.unwrap();
+
+        let t = book.traffic();
+        assert_eq!(t.len(), 1);
+        assert_eq!((t[0].tx, t[0].rx), (3, 5));
     }
 }
