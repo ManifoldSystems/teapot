@@ -9,16 +9,18 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use teapot_proto::{ConnectRequest, ConnectResponse, read_line};
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, sync::watch};
 use tracing::{debug, info, warn};
 
-use crate::net;
+use crate::{net, paths::PathBook};
 
 #[derive(Debug, Clone)]
 pub enum Allow {
     /// Any endpoint may use this exit node. Only for local experiments.
     Any,
     Only(HashSet<EndpointId>),
+    /// Kept current by control; clients dropped from it are disconnected.
+    Live(watch::Receiver<HashSet<EndpointId>>),
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +34,7 @@ impl ExitPolicy {
         match &self.allow {
             Allow::Any => true,
             Allow::Only(ids) => ids.contains(peer),
+            Allow::Live(rx) => rx.borrow().contains(peer),
         }
     }
 }
@@ -39,12 +42,14 @@ impl ExitPolicy {
 #[derive(Debug, Clone)]
 pub struct ExitNode {
     policy: Arc<ExitPolicy>,
+    paths: PathBook,
 }
 
 impl ExitNode {
-    pub fn new(policy: ExitPolicy) -> Self {
+    pub fn new(policy: ExitPolicy, paths: PathBook) -> Self {
         Self {
             policy: Arc::new(policy),
+            paths,
         }
     }
 }
@@ -58,11 +63,28 @@ impl ProtocolHandler for ExitNode {
             return Ok(());
         }
         info!(%peer, "client connected");
+        self.paths.insert(&conn);
+
+        let mut live = match &self.policy.allow {
+            Allow::Live(rx) => Some(rx.clone()),
+            _ => None,
+        };
 
         // One long-lived connection per client; every proxied TCP connection
         // arrives as its own bi-stream.
         loop {
-            let (send, recv) = match conn.accept_bi().await {
+            let accepted = tokio::select! {
+                res = conn.accept_bi() => res,
+                Some(()) = allowlist_changed(&mut live) => {
+                    if !self.policy.permits(&peer) {
+                        warn!(%peer, "removed from allowlist; disconnecting");
+                        conn.close(1u32.into(), b"not allowed");
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+            let (send, recv) = match accepted {
                 Ok(streams) => streams,
                 Err(e) => {
                     info!(%peer, "client disconnected: {e}");
@@ -76,6 +98,14 @@ impl ProtocolHandler for ExitNode {
                 }
             });
         }
+    }
+}
+
+/// Resolves when a live allowlist changes; never resolves for static ones.
+async fn allowlist_changed(live: &mut Option<watch::Receiver<HashSet<EndpointId>>>) -> Option<()> {
+    match live {
+        Some(rx) => rx.changed().await.ok(),
+        None => std::future::pending().await,
     }
 }
 

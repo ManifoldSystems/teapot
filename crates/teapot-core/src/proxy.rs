@@ -16,20 +16,24 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+use crate::paths::PathBook;
+
 const MAX_HEAD: usize = 16 * 1024;
 
 pub struct ProxyClient {
     endpoint: Endpoint,
     exit: EndpointId,
     conn: Mutex<Option<Connection>>,
+    paths: PathBook,
 }
 
 impl ProxyClient {
-    pub fn new(endpoint: Endpoint, exit: EndpointId) -> Self {
+    pub fn new(endpoint: Endpoint, exit: EndpointId, paths: PathBook) -> Self {
         Self {
             endpoint,
             exit,
             conn: Mutex::new(None),
+            paths,
         }
     }
 
@@ -48,6 +52,7 @@ impl ProxyClient {
             .await
             .context("connecting to exit node")?;
         info!(exit = %self.exit, "connected");
+        self.paths.insert(&conn);
         tokio::spawn(log_path_changes(conn.clone()));
         *slot = Some(conn.clone());
         Ok(conn)

@@ -71,7 +71,7 @@ POST /v1/auth/verify {node_id, challenge, signature}
 | Method | Path | Body / result |
 |---|---|---|
 | GET | `/v1/devices/me` | device row |
-| PUT | `/v1/devices/me` | `{name?, platform?, can_exit}` |
+| PUT | `/v1/devices/me` | `{name?, platform?, can_exit?}`; omitted fields are kept, `can_exit: false` also turns exit off |
 | GET | `/v1/peers` | `[{node_id, name, platform, online, exit}]`; `403 PENDING` until approved |
 | GET | `/v1/exit/allowlist` | `{exit_enabled, allow: [node_id]}`; `403 PENDING` until approved |
 | GET | `/v1/presence` | WebSocket upgrade; token as Bearer or `?token=` |
