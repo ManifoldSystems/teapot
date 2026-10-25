@@ -42,6 +42,15 @@ the same.
   request per stream.
 - Exit node refusal or connection failure → `502 Bad Gateway` with the reason
   as the body.
+- **Choosing the exit per request**: the proxy username names it
+  (`http://<exit>@127.0.0.1:1080`), sent by clients as
+  `Proxy-Authorization: Basic base64("<exit>:")` — on `CONNECT` too. `<exit>`
+  is a name, full endpoint id, or id prefix (≥ 8 chars); the password is
+  ignored. The named exit must be approved, online and enabled, otherwise
+  `502` with the reason (no fallback). No username → the agent's default exit.
+  `Proxy-Authorization` is stripped before forwarding.
+- `GET /_teapot/exits` (origin form, to the proxy itself) →
+  `{"exits":[{name, node_id, online, public_ipv4, default}]}`.
 
 ## Control
 

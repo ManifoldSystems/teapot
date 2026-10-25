@@ -71,7 +71,16 @@ Point apps at `http://127.0.0.1:1080`:
 curl -x http://127.0.0.1:1080 https://ifconfig.me
 ```
 
-It prints B's public IP. A and B on the same network share one IP, so test
+It prints B's public IP. Name a different exit for a single request with the
+proxy username, and list the choices from the proxy itself:
+
+```bash
+curl -x http://home-exit@127.0.0.1:1080 https://ifconfig.me   # this request via home-exit
+curl http://127.0.0.1:1080/_teapot/exits                         # what can be named
+```
+
+The Python library [`teapot-py`](https://github.com/ManifoldSystems/teapot-py)
+wraps both. A and B on the same network share one IP, so test
 across networks (laptop on Wi-Fi, B on a phone hotspot or a VPS).
 
 `teapot status` shows this device's approval, exit state, public IPv4/IPv6

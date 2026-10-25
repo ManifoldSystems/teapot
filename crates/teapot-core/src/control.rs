@@ -104,6 +104,16 @@ impl Peer {
             .clone()
             .unwrap_or_else(|| self.node_id[..8].to_string())
     }
+
+    /// Name (case-insensitive), full id, or an id prefix of at least 8 chars.
+    pub fn matches(&self, wanted: &str) -> bool {
+        self.node_id == wanted
+            || self
+                .name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(wanted))
+            || (wanted.len() >= 8 && self.node_id.starts_with(wanted))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
