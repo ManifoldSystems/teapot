@@ -83,8 +83,8 @@ POST /v1/auth/verify {node_id, challenge, signature}
 | Method | Path | Body / result |
 |---|---|---|
 | GET | `/v1/devices/me` | device row |
-| PUT | `/v1/devices/me` | `{name?, platform?, can_exit?}`; omitted fields are kept. `can_exit` = the device serves exit right now; the owner's exit toggle is stored separately and survives restarts |
-| GET | `/v1/peers` | `[{node_id, name, platform, online, exit, public_ipv4}]`; `403 PENDING` until approved. Clients skip exits whose `public_ipv4` equals their own |
+| PUT | `/v1/devices/me` | `{name?, platform?, model?, can_exit?}`; omitted fields are kept. `can_exit` = the device serves exit right now; the owner's exit toggle is stored separately and survives restarts |
+| GET | `/v1/peers` | `[{node_id, name, device_name, platform, model, online, exit, public_ipv4}]` — `name` is the owner's alias when set (so `--exit`/`via=` can use it), `device_name` what the device reports; `403 PENDING` until approved. Clients skip exits whose `public_ipv4` equals their own |
 | GET | `/v1/exit/allowlist` | `{exit_enabled, allow: [node_id]}`; `403 PENDING` until approved |
 | GET | `/v1/presence` | WebSocket upgrade; token as Bearer or `?token=` |
 
