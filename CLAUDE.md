@@ -104,6 +104,10 @@ running (see teapot-control CLAUDE.md).
 - **Presence needs a silence timeout.** A phone stayed "connected" to nothing
   for 8 h (process alive, socket dead). 45 s without any message from control
   → reconnect (`SILENCE_LIMIT`).
+- **A restarted exit leaves a silent connection, not a closed one.** Same id,
+  new process: the cached connection never errors until QUIC's idle timeout.
+  Reused connections get 5 s; no datagram at all from the peer → close, redial,
+  retry once (`REUSED_ANSWER_TIMEOUT`, test `restarted_exit_is_redialed…`).
 - **Never hold the proxy state lock across a dial** — failover would wait for a
   dead exit to time out.
 - **Paths via Tailscale.** All fleet machines share a tailnet; iroh often picks
