@@ -94,6 +94,31 @@ POST /v1/auth/verify {node_id, challenge, signature}
 
 Online = the socket is open. One socket per device.
 
+Clients send optional `X-Teapot-Version` (application version/build, 1–64
+ASCII letters/digits/`.+_-`) and `X-Teapot-Protocol: 1` on the WebSocket
+upgrade. Control records these as `agent_version` and `agent_protocol` in
+the device row and peer API; missing headers explicitly record null (legacy
+client). A CLI status query does not overwrite the running agent's version.
+Invalid metadata returns 400; an unsupported explicit protocol returns 426.
+Server sends `{"type":"hello","protocol":1,"control_version":"<worker version id>",
+"presence_generation":"<generation>"}` on connect. Unknown frames are ignored
+for forward compatibility. Legacy servers may omit hello.
+
+Reconnect uses exponential backoff, capped at 60 seconds, with randomized
+delay between half and the full backoff; healthy connections (30 s) reset it.
+Presence reconnection keeps the local proxy and iroh endpoint running.
+
+Each deployment selects a fresh `PRESENCE_GENERATION` object name. The deploy
+script remembers the previous generation (`global` for legacy deployments),
+deploys, then authenticates as admin to POST `/admin/presence/retire`.
+That endpoint closes the previous generation's sockets with its existing
+`/kick` API, so old agents also reconnect without a new protocol handler.
+The deployment command fails if retirement fails; retry the endpoint before
+another deployment. `/admin/presence.json` exposes the worker version, current
+generation and previous generation's remaining open sockets to admins.
+This is a brief presence interruption; reconnecting clients re-fetch peers
+and allowlists. Do not gradually split traffic across Worker versions.
+
 ```
 client → "ping"                        server → "pong"
 client → {"type":"status",
@@ -109,6 +134,7 @@ server → {"type":"peers_changed"}      approval, exit, or online state changed
                                        refetch /v1/peers and /v1/exit/allowlist
 close 4000  replaced by a newer connection of the same device
 close 4001  removed or revoked from the dashboard
+            also used to retire a previous presence generation (no revocation)
 ```
 
 ## Logs
