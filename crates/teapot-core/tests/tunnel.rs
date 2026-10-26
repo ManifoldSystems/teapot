@@ -1,11 +1,18 @@
 //! Exit node and local proxy wired together in one process, over iroh with
 //! no relay and no DNS: addresses come from an in-memory lookup.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use iroh::{
-    Endpoint, EndpointId, RelayMode, SecretKey, address_lookup::MemoryLookup, endpoint::presets,
-    protocol::Router,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr,
+    address_lookup::MemoryLookup, endpoint::presets, protocol::Router,
 };
 use teapot_core::{
     exit::{Allow, ExitNode, ExitPolicy},
@@ -271,4 +278,89 @@ async fn proxy_username_picks_the_exit() {
         .collect();
     assert_eq!(names, ["one", "two"]);
     assert_eq!(json["exits"][0]["default"], true);
+}
+
+/// Exit node on 127.0.0.1 only, with a fixed key, so it can be restarted as
+/// "the same device" the way the phone app restarts.
+async fn exit_node_at(lookup: &MemoryLookup, key: SecretKey) -> Router {
+    let ep = Endpoint::builder(presets::Minimal)
+        .secret_key(key)
+        .relay_mode(RelayMode::Disabled)
+        .address_lookup(lookup.clone())
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    Router::builder(ep)
+        .accept(
+            ALPN_PROXY,
+            ExitNode::new(
+                ExitPolicy {
+                    allow: Allow::Any,
+                    allow_lan: true,
+                },
+                PathBook::default(),
+            ),
+        )
+        .spawn()
+}
+
+/// UDP relay in front of `to` that can be cut, so a connection through it
+/// goes silent instead of closing: what a client sees when the exit's
+/// process dies or its phone changes network.
+async fn cuttable_relay(to: std::net::SocketAddr) -> (std::net::SocketAddr, Arc<AtomicBool>) {
+    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    let cut = Arc::new(AtomicBool::new(false));
+    let flag = cut.clone();
+    tokio::spawn(async move {
+        let mut client = None;
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            if flag.load(Ordering::SeqCst) {
+                continue;
+            }
+            let dest = if from == to {
+                client
+            } else {
+                client = Some(from);
+                Some(to)
+            };
+            if let Some(dest) = dest {
+                let _ = sock.send_to(&buf[..n], dest).await;
+            }
+        }
+    });
+    (addr, cut)
+}
+
+#[tokio::test]
+async fn restarted_exit_is_redialed_without_failing_the_request() {
+    let lookup = MemoryLookup::new();
+    let key = SecretKey::generate();
+    let exit = key.public();
+    let first = exit_node_at(&lookup, key.clone()).await;
+    let (relay, cut) = cuttable_relay(first.endpoint().bound_sockets()[0]).await;
+    lookup.set_endpoint_info(EndpointAddr::from_parts(exit, [TransportAddr::Ip(relay)]));
+    let (proxy_addr, _client) = proxy(endpoint(&lookup).await, exit).await;
+    let target = target().await;
+    let get = format!("GET http://{target}/ HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(send(&proxy_addr, &get).await.ends_with("hello"));
+
+    // The old process dies without closing; a new one with the same key comes
+    // up elsewhere (dropping a Router aborts its endpoint ungracefully).
+    cut.store(true, Ordering::SeqCst);
+    drop(first);
+    let second = exit_node_at(&lookup, key).await;
+    lookup.set_endpoint_info(second.endpoint().addr());
+
+    let started = std::time::Instant::now();
+    let res = send(&proxy_addr, &get).await;
+    assert!(res.ends_with("hello"), "{res}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
 }
