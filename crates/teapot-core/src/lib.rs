@@ -4,6 +4,7 @@ pub mod agent;
 pub mod control;
 pub mod exit;
 pub mod key;
+pub mod logs;
 pub mod net;
 pub mod paths;
 pub mod proxy;
