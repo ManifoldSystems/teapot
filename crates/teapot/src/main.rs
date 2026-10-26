@@ -1,3 +1,4 @@
+mod logs;
 mod service;
 mod sysproxy;
 
@@ -53,6 +54,8 @@ enum Cmd {
     },
     /// Log in to control and show this device and its peers.
     Status,
+    /// View this device's local log or another device's logs via control.
+    Logs(logs::LogArgs),
     /// Stay online: serve as an exit node when the dashboard allows it, and
     /// run a local proxy that exits through another device.
     Up(UpArgs),
@@ -137,16 +140,34 @@ enum ServiceCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    let result = run().await;
+    if let Err(error) = &result {
+        tracing::error!("teapot stopped: {error:#}");
+    }
+    let _ = tokio::task::spawn_blocking(teapot_core::logs::flush).await;
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
+    use tracing_subscriber::prelude::*;
+    let cli = Cli::parse();
+    let log_file = cli
+        .key
+        .clone()
+        .or_else(|| dirs::config_dir().map(|d| d.join("teapot/secret.key")))
+        .filter(|_| !matches!(cli.cmd, Cmd::Logs(_)))
+        .map(|p| p.with_extension("log.jsonl"));
+    let collector = teapot_core::logs::init(log_file);
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "teapot=info,teapot_core=info".into()),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(collector)
         .init();
     // iroh is built on ring; give reqwest and tungstenite the same provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let cli = Cli::parse();
 
     if let Cmd::SystemProxy { cmd } = &cli.cmd {
         match cmd {
@@ -191,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Id => println!("{}", secret_key.public()),
         Cmd::Login { no_browser } => login(&cli, secret_key, *no_browser).await?,
         Cmd::Status => status(&cli.control, secret_key).await?,
+        Cmd::Logs(args) => logs::run(&cli.control, secret_key, &key_path, args).await?,
         Cmd::Service { .. } | Cmd::SystemProxy { .. } => unreachable!("handled above"),
         Cmd::Up(args) => up(&cli, secret_key, &key_path, args.clone()).await?,
         Cmd::Exit {
@@ -344,6 +366,19 @@ async fn up(
         router.shutdown().await?;
     }
     endpoint.close().await;
+    info!("teapot stopped");
+    if let Some(buffer) = teapot_core::logs::buffer() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let batch = buffer.batch();
+                if batch.is_empty() || control.upload_logs(&batch).await.is_err() {
+                    break;
+                }
+                buffer.ack(&batch);
+            }
+        })
+        .await;
+    }
     Ok(())
 }
 

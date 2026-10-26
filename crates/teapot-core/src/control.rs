@@ -169,6 +169,9 @@ impl ControlClient {
     /// moved networks, so exit choices are re-evaluated right away.
     pub fn set_public_ips(&self, ips: PublicIps) {
         let mut current = self.public_ips.lock().expect("public ips poisoned");
+        if *current != ips {
+            info!(v4 = ?ips.v4, v6 = ?ips.v6, "public addresses changed");
+        }
         if current.v4 != ips.v4 {
             self.changed.send_modify(|n| *n += 1);
         }
@@ -252,6 +255,100 @@ impl ControlClient {
         self.call(Method::GET, "/v1/exit/allowlist", None).await
     }
 
+    pub async fn upload_logs(&self, entries: &[crate::logs::LogEntry]) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .call(Method::POST, "/v1/logs", Some(json!({"entries": entries})))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn logs(
+        &self,
+        device: Option<&str>,
+        level: &str,
+    ) -> anyhow::Result<Vec<crate::logs::StoredLog>> {
+        #[derive(Deserialize)]
+        struct History {
+            entries: Vec<crate::logs::StoredLog>,
+        }
+        let mut url = reqwest::Url::parse("https://control/v1/logs")?;
+        url.query_pairs_mut().append_pair("level", level);
+        if let Some(device) = device {
+            url.query_pairs_mut().append_pair("device", device);
+        }
+        let result: History = self
+            .call(
+                Method::GET,
+                &format!("/v1/logs?{}", url.query().unwrap_or_default()),
+                None,
+            )
+            .await?;
+        Ok(result.entries)
+    }
+
+    /// One viewer socket, independent of presence. Caller reconnects using cursor.
+    pub async fn follow_logs(
+        &self,
+        device: Option<&str>,
+        level: &str,
+        cursor: &mut u64,
+        mut emit: impl FnMut(crate::logs::StoredLog),
+    ) -> anyhow::Result<()> {
+        let mut url = reqwest::Url::parse(&format!(
+            "{}/v1/logs/stream",
+            self.base
+                .replacen("https://", "wss://", 1)
+                .replacen("http://", "ws://", 1)
+        ))?;
+        url.query_pairs_mut().append_pair("level", level);
+        if let Some(device) = device {
+            url.query_pairs_mut().append_pair("device", device);
+        }
+        if *cursor > 0 {
+            url.query_pairs_mut()
+                .append_pair("after", &cursor.to_string());
+        }
+        let mut req = url.as_str().into_client_request()?;
+        req.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", self.token().await?))?,
+        );
+        req.headers_mut()
+            .insert("user-agent", HeaderValue::from_static(USER_AGENT));
+        let (mut ws, _) = match tokio_tungstenite::connect_async(req).await {
+            Ok(ok) => ok,
+            Err(tungstenite::Error::Http(res)) if res.status() == StatusCode::UNAUTHORIZED => {
+                *self.token.lock().await = None;
+                bail!("log viewer token expired");
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut ping = tokio::time::interval(PING_EVERY);
+        let mut heard = Instant::now();
+        loop {
+            tokio::select! {
+                _ = ping.tick() => {
+                    if heard.elapsed() > SILENCE_LIMIT { bail!("log stream silent; reconnecting"); }
+                    ws.send(Message::text("ping")).await?;
+                }
+                message = ws.next() => {
+                    heard = Instant::now();
+                    match message {
+                        Some(Ok(Message::Text(text))) if text.as_str() != "pong" => {
+                            #[derive(Deserialize)]
+                            struct Batch { entries: Vec<crate::logs::StoredLog> }
+                            let batch: Batch = serde_json::from_str(&text)?;
+                            for e in batch.entries { if e.cursor > *cursor { *cursor = e.cursor; emit(e); } }
+                        }
+                        Some(Ok(Message::Close(_))) | None => bail!("log stream closed"),
+                        Some(Err(e)) => return Err(e.into()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     async fn token(&self) -> anyhow::Result<String> {
         if let Some(t) = self.token.lock().await.clone() {
             return Ok(t);
@@ -309,6 +406,21 @@ impl ControlClient {
 
     /// Keeps the presence socket up forever, reporting `paths`.
     pub async fn run_presence(self: Arc<Self>, paths: PathBook) {
+        let presence = self.clone();
+        tokio::join!(presence.presence_loop(paths), async {
+            loop {
+                tokio::time::sleep(STATUS_EVERY).await;
+                if let Some(buffer) = crate::logs::buffer() {
+                    let entries = buffer.batch();
+                    if !entries.is_empty() && self.upload_logs(&entries).await.is_ok() {
+                        buffer.ack(&entries);
+                    }
+                }
+            }
+        });
+    }
+
+    async fn presence_loop(self: Arc<Self>, paths: PathBook) {
         let mut backoff = Duration::from_secs(1);
         loop {
             let started = Instant::now();
@@ -319,6 +431,10 @@ impl ControlClient {
             if started.elapsed() > Duration::from_secs(30) {
                 backoff = Duration::from_secs(1);
             }
+            info!(
+                retry_seconds = backoff.as_secs(),
+                "presence reconnect scheduled"
+            );
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(BACKOFF_MAX);
         }

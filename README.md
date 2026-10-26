@@ -119,6 +119,36 @@ The proxy logs which path it uses (`path: relay ...` or `path: direct ...`)
 whenever it changes. Every device reports its paths and tunnel bytes per peer
 (since the agent started) to the dashboard.
 
+## Logs
+
+Every agent keeps local JSONL history beside its key (`secret.log.jsonl`, plus
+one rotated file; roughly 2 MiB each) and batches diagnostic events to control
+every five seconds. Terminal / launchd / systemd output remains available.
+The disk writer and upload queue are bounded so logging cannot stall tunnels.
+
+```bash
+teapot logs                         # latest local events; works offline
+teapot logs --follow                 # follow local history
+teapot logs quantumz --follow        # watch another approved device
+teapot logs --all --follow           # all devices + control
+teapot logs control --level warn     # control warnings/errors
+teapot logs quantumz --json          # JSONL for tooling
+RUST_LOG=teapot=debug,teapot_core=debug teapot up  # include tunnel details
+```
+
+The dashboard's **Mesh logs** page (`/admin/logs`) has live device/level/search
+filters, pause/resume, and copy. Device detail pages link to their own logs.
+The Flutter app has the same local/remote viewer from Status and Mesh; tap a
+peer to watch its logs. Viewing uses a separate connection and does not take
+over the running agent's endpoint or presence socket.
+
+Only approved devices and the dashboard admin can view mesh logs. Control
+retains the latest 10,000 events globally, for at most seven days. Reconnect
+resumes from a server cursor; upload retries are deduplicated. Local upload
+queues keep up to 1,000 events in memory (not across process restarts); oldest
+events may be dropped under load or prolonged outages. Logs are diagnostics,
+not a lossless audit trail. See `docs/protocol.md` for the shared contract.
+
 ## Layout
 
 ```

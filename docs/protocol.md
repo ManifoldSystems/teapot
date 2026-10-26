@@ -110,3 +110,39 @@ server → {"type":"peers_changed"}      approval, exit, or online state changed
 close 4000  replaced by a newer connection of the same device
 close 4001  removed or revoked from the dashboard
 ```
+
+## Logs
+
+Logs are local first, then uploaded in batches over HTTPS. Viewing uses a
+separate WebSocket (never replaces the device's presence connection). All
+approved devices in this single-owner mesh can read each other's logs.
+
+- `POST /v1/logs` (device Bearer, approved): `{entries: [entry]}`; at most 50
+  entries / 128 KiB per request. Returns `data: {accepted: n}`. Identity is
+  assigned by control, never supplied by the publisher.
+- Entry: `{id, timestamp, level, source, message}`. `id` is a stable unique
+  event id (max 96 chars), `timestamp` Unix milliseconds, `level` one of
+  `debug|info|warn|error`, `source` max 128 chars, `message` max 2048 chars.
+  Retries with the same `(node_id, id)` are deduplicated.
+- `GET /v1/logs` (approved device) or `/admin/logs.json` (admin cookie):
+  optional `device=<full node id|control>`, `level=<minimum level>`,
+  `after=<cursor>`. No device means all. Returns
+  `{success:true,data:{entries:[storedEntry]}}`, oldest first. Without `after`,
+  returns the most recent 200 matches; with `after`, the next 200 matches.
+- `GET /v1/logs/stream` (approved device Bearer) or `/admin/logs/stream`
+  (admin cookie): WebSocket with the same filters. Sends
+  `{type:"logs",entries:[storedEntry]}` for initial history and live batches.
+  Reconnect with the last received `cursor` as `after`; all retained matches
+  after that cursor are replayed. `ping` → `pong`. Reconnect after 45 seconds
+  without a response. Subscriptions expire after one hour (close 4002),
+  forcing authentication again; revocation/removal closes viewers (4001).
+  Replay may span multiple frames (up to 20 entries per frame).
+- Stored entry adds `node_id` (`control` for server events), `cursor`
+  (monotonic integer), and `received_at` (Unix milliseconds). Client clocks
+  are informational; ordering/reconnect use the server cursor.
+- Control retains at most 10,000 events globally and at most seven days.
+  Local upload queues are bounded; oldest events may be dropped when offline
+  or overloaded. This is diagnostic logging, not a guaranteed audit ledger.
+- Log lifecycle, peer/path/exit changes, connection failures, and control
+  actions. Never log keys, tokens, cookies, request bodies, or proxy headers.
+  Remote logs are displayed only, never re-published as local events.

@@ -11,6 +11,7 @@ iroh = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
