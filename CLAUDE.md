@@ -101,6 +101,9 @@ running (see teapot-control CLAUDE.md).
 - **launchd `Bootstrap failed: 5`** if you bootstrap right after bootout;
   `service.rs` waits until `launchctl print` fails first.
 - **SIGTERM**, not only Ctrl+C, must trigger cleanup (launchd/systemd stop).
+- **Presence needs a silence timeout.** A phone stayed "connected" to nothing
+  for 8 h (process alive, socket dead). 45 s without any message from control
+  → reconnect (`SILENCE_LIMIT`).
 - **Never hold the proxy state lock across a dial** — failover would wait for a
   dead exit to time out.
 - **Paths via Tailscale.** All fleet machines share a tailnet; iroh often picks

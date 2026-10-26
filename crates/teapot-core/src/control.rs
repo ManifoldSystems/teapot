@@ -20,6 +20,10 @@ use crate::paths::{PathBook, PeerPath, PeerTraffic};
 pub const USER_AGENT: &str = concat!("teapot/", env!("CARGO_PKG_VERSION"));
 
 const PING_EVERY: Duration = Duration::from_secs(20);
+/// No message at all (not even a pong) for this long means the socket is
+/// dead even if TCP has not noticed — mobile CGNAT drops idle flows silently.
+/// Seen: a phone's agent stayed "connected" to nothing for 8 hours.
+const SILENCE_LIMIT: Duration = Duration::from_secs(45);
 const STATUS_EVERY: Duration = Duration::from_secs(5);
 /// Re-send an unchanged status this often so the dashboard never goes stale.
 const STATUS_REFRESH: Duration = Duration::from_secs(60);
@@ -350,10 +354,16 @@ impl ControlClient {
         let mut ping = tokio::time::interval(PING_EVERY);
         let mut status = tokio::time::interval(STATUS_EVERY);
         let mut last_sent: Option<(Report, Instant)> = None;
+        let mut last_heard = Instant::now();
 
         loop {
             tokio::select! {
-                _ = ping.tick() => tx.send(Message::text("ping")).await?,
+                _ = ping.tick() => {
+                    if last_heard.elapsed() > SILENCE_LIMIT {
+                        bail!("no reply from control for {:?}; reconnecting", last_heard.elapsed());
+                    }
+                    tx.send(Message::text("ping")).await?
+                }
                 _ = status.tick() => {
                     let now = (paths.snapshot(), paths.traffic(), self.public_ips());
                     let due = match &last_sent {
@@ -366,7 +376,11 @@ impl ControlClient {
                         last_sent = Some((now, Instant::now()));
                     }
                 }
-                msg = rx.next() => match msg {
+                msg = rx.next() => {
+                    if matches!(msg, Some(Ok(_))) {
+                        last_heard = Instant::now();
+                    }
+                    match msg {
                     None => return Ok("stream ended".into()),
                     Some(Err(e)) => return Err(e.into()),
                     Some(Ok(Message::Close(frame))) => {
@@ -384,7 +398,8 @@ impl ControlClient {
                         }
                     }
                     Some(Ok(_)) => {}
-                },
+                    }
+                }
             }
         }
     }
