@@ -29,6 +29,10 @@ use crate::{
 
 const MAX_HEAD: usize = 16 * 1024;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a reused connection may stay completely silent after CONNECT
+/// before we assume the exit restarted under us (same id, new process): the
+/// old connection never errors, it just goes quiet until QUIC's idle timeout.
+const REUSED_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ProxyClient {
     endpoint: Endpoint,
@@ -86,14 +90,15 @@ impl ProxyClient {
         EndpointId::from_str(wanted).map_err(|_| anyhow!("no exit node matches {wanted:?}"))
     }
 
-    /// Connection to a specific exit, reusing the default one when it is the same.
-    async fn connection_to(&self, exit: EndpointId) -> anyhow::Result<Connection> {
+    /// Connection to a specific exit, reusing the default one when it is the
+    /// same. `true` when it was dialed just now.
+    async fn connection_to(&self, exit: EndpointId) -> anyhow::Result<(Connection, bool)> {
         if self.exit().await == Some(exit) {
-            return self.connection().await;
+            return self.dialed_connection().await;
         }
         let mut conns = self.explicit.lock().await;
         if let Some(conn) = conns.get(&exit).filter(|c| c.close_reason().is_none()) {
-            return Ok(conn.clone());
+            return Ok((conn.clone(), false));
         }
         info!(%exit, "dialing requested exit node");
         let conn = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(exit, ALPN_PROXY))
@@ -103,7 +108,7 @@ impl ProxyClient {
         self.paths.insert(&conn);
         tokio::spawn(log_path_changes(conn.clone()));
         conns.insert(exit, conn.clone());
-        Ok(conn)
+        Ok((conn, true))
     }
 
     /// JSON for `GET /_teapot/exits`.
@@ -152,13 +157,18 @@ impl ProxyClient {
 
     /// Returns the live connection to the exit node, redialing if it closed.
     pub async fn connection(&self) -> anyhow::Result<Connection> {
+        Ok(self.dialed_connection().await?.0)
+    }
+
+    /// [`connection`](Self::connection), plus `true` when it was dialed just now.
+    async fn dialed_connection(&self) -> anyhow::Result<(Connection, bool)> {
         if let Some(conn) = self.live().await? {
-            return Ok(conn);
+            return Ok((conn, false));
         }
         let _dialing = self.dial.lock().await;
         // Someone may have dialed while we waited.
         if let Some(conn) = self.live().await? {
-            return Ok(conn);
+            return Ok((conn, false));
         }
         let exit = self.exit().await.context("no exit node online")?;
 
@@ -177,7 +187,7 @@ impl ProxyClient {
         self.paths.insert(&conn);
         tokio::spawn(log_path_changes(conn.clone()));
         state.conn = Some(conn.clone());
-        Ok(conn)
+        Ok((conn, true))
     }
 
     /// The open connection, if any; errors when no exit node is chosen.
@@ -205,32 +215,66 @@ impl ProxyClient {
         target: &str,
         via: Option<&str>,
     ) -> anyhow::Result<(SendStream, RecvStream, EndpointId)> {
-        let conn = match via {
-            None => self.connection().await?,
-            Some(wanted) => self.connection_to(self.resolve(wanted)?).await?,
+        let wanted = via.map(|w| self.resolve(w)).transpose()?;
+        let (conn, fresh) = match wanted {
+            None => self.dialed_connection().await?,
+            Some(exit) => self.connection_to(exit).await?,
         };
-        let exit = conn.remote_id();
-        let result = async {
-            let (mut send, mut recv) = conn.open_bi().await?;
-            let req = ConnectRequest {
-                target: target.to_string(),
-            };
-            send.write_all(&req.encode()).await?;
-            match ConnectResponse::parse(&read_line(&mut recv).await?)? {
-                ConnectResponse::Ok => Ok((send, recv, exit)),
-                ConnectResponse::Err(reason) => bail!("exit node refused {target}: {reason}"),
+        if fresh {
+            return handshake(&conn, target).await;
+        }
+        // A reused connection may belong to an exit that has since restarted.
+        // A live peer acknowledges our CONNECT within one round trip even when
+        // the target itself is slow, so silence means the connection is dead.
+        let received = conn.stats().udp_rx.datagrams;
+        let answer = handshake(&conn, target);
+        tokio::pin!(answer);
+        let result = match tokio::time::timeout(REUSED_ANSWER_TIMEOUT, &mut answer).await {
+            Ok(result) => result,
+            Err(_) if conn.stats().udp_rx.datagrams > received => answer.await,
+            Err(_) => {
+                conn.close(0u32.into(), b"silent; redialing");
+                Err(anyhow!("existing connection went silent"))
             }
+        };
+        match result {
+            Ok(streams) => return Ok(streams),
+            Err(e) if conn.close_reason().is_none() => return Err(e),
+            Err(e) => info!(exit = %conn.remote_id(), "{e:#}; redialing"),
         }
-        .await;
-        // A stream error after the exit node closed us (e.g. allowlist) says
-        // only "connection lost"; the close reason is the useful part.
-        if result.is_err()
-            && let Some(reason) = conn.close_reason()
-        {
-            bail!("exit node closed the connection: {reason}");
-        }
-        result
+        let (conn, _) = match wanted {
+            None => self.dialed_connection().await?,
+            Some(exit) => self.connection_to(exit).await?,
+        };
+        handshake(&conn, target).await
     }
+}
+
+/// Sends CONNECT on a new stream and waits for the exit's answer.
+async fn handshake(
+    conn: &Connection,
+    target: &str,
+) -> anyhow::Result<(SendStream, RecvStream, EndpointId)> {
+    let result = async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let req = ConnectRequest {
+            target: target.to_string(),
+        };
+        send.write_all(&req.encode()).await?;
+        match ConnectResponse::parse(&read_line(&mut recv).await?)? {
+            ConnectResponse::Ok => Ok((send, recv, conn.remote_id())),
+            ConnectResponse::Err(reason) => bail!("exit node refused {target}: {reason}"),
+        }
+    }
+    .await;
+    // A stream error after the exit node closed us (e.g. allowlist) says
+    // only "connection lost"; the close reason is the useful part.
+    if result.is_err()
+        && let Some(reason) = conn.close_reason()
+    {
+        bail!("exit node closed the connection: {reason}");
+    }
+    result
 }
 
 /// Logs whenever the selected path flips between direct and relay.
