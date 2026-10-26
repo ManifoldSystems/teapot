@@ -2999,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "teapot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3018,13 +3018,14 @@ dependencies = [
 
 [[package]]
 name = "teapot-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "futures-util",
  "hex",
  "iroh",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",
@@ -3037,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "teapot-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokio",
 ]

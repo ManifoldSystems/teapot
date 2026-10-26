@@ -18,6 +18,7 @@ use crate::paths::{PathBook, PeerPath, PeerTraffic};
 /// Cloudflare rejects library-default user agents (error 1010), so always
 /// identify ourselves.
 pub const USER_AGENT: &str = concat!("teapot/", env!("CARGO_PKG_VERSION"));
+pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const PING_EVERY: Duration = Duration::from_secs(20);
 /// No message at all (not even a pong) for this long means the socket is
@@ -431,11 +432,9 @@ impl ControlClient {
             if started.elapsed() > Duration::from_secs(30) {
                 backoff = Duration::from_secs(1);
             }
-            info!(
-                retry_seconds = backoff.as_secs(),
-                "presence reconnect scheduled"
-            );
-            tokio::time::sleep(backoff).await;
+            let delay = backoff.mul_f64(0.5 + rand::random::<f64>() * 0.5);
+            info!(retry_ms = delay.as_millis(), "presence reconnect scheduled");
+            tokio::time::sleep(delay).await;
             backoff = (backoff * 2).min(BACKOFF_MAX);
         }
     }
@@ -454,6 +453,8 @@ impl ControlClient {
             HeaderValue::from_str(&format!("Bearer {}", self.token().await?))?,
         );
         headers.insert("user-agent", HeaderValue::from_static(USER_AGENT));
+        headers.insert("x-teapot-version", HeaderValue::from_static(AGENT_VERSION));
+        headers.insert("x-teapot-protocol", HeaderValue::from_static("1"));
 
         let (ws, _) = match tokio_tungstenite::connect_async(req).await {
             Ok(ok) => ok,
@@ -508,9 +509,21 @@ impl ControlClient {
                         if text.as_str() == "pong" {
                             continue;
                         }
-                        if text.contains("\"peers_changed\"") {
-                            debug!("control: peers changed");
-                            self.changed.send_modify(|n| *n += 1);
+                        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
+                            match msg["type"].as_str() {
+                                Some("peers_changed") => {
+                                    debug!("control: peers changed");
+                                    self.changed.send_modify(|n| *n += 1);
+                                }
+                                Some("hello") => info!(
+                                    protocol = ?msg["protocol"],
+                                    control_version = ?msg["control_version"],
+                                    generation = ?msg["presence_generation"],
+                                    agent_version = AGENT_VERSION,
+                                    "control handshake"
+                                ),
+                                _ => {}
+                            }
                         }
                     }
                     Some(Ok(_)) => {}
