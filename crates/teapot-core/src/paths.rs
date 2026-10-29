@@ -12,7 +12,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use iroh::{EndpointId, endpoint::Connection};
+use iroh::{EndpointId, TransportAddr, endpoint::Connection};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -21,6 +21,23 @@ pub struct PeerPath {
     pub peer: String,
     pub kind: &'static str,
     pub rtt_ms: u64,
+    /// Remote address of the selected path: the peer's socket address when
+    /// direct, the relay host when relay. `None` when iroh exposes no address.
+    /// Optional on the wire so legacy readers and senders stay valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
+}
+
+/// The selected path's remote address as a human-readable string: `ip:port`
+/// for a direct path, the relay host for a relayed one. `None` when the
+/// address is a shape we don't render (e.g. a custom transport).
+fn path_addr(remote: &TransportAddr) -> Option<String> {
+    match remote {
+        TransportAddr::Ip(addr) => Some(addr.to_string()),
+        // The relay host alone; the scheme/port add no signal for the dashboard.
+        TransportAddr::Relay(url) => url.host_str().map(str::to_string),
+        _ => None,
+    }
 }
 
 /// Tunnel payload since this process started, from this device's side:
@@ -80,6 +97,7 @@ impl PathBook {
                     peer: peer.to_string(),
                     kind: if path.is_relay() { "relay" } else { "direct" },
                     rtt_ms: path.rtt().as_millis() as u64,
+                    addr: path_addr(path.remote_addr()),
                 })
             })
             .collect();
@@ -182,5 +200,33 @@ mod tests {
         let t = book.traffic();
         assert_eq!(t.len(), 1);
         assert_eq!((t[0].tx, t[0].rx), (3, 5));
+    }
+
+    #[test]
+    fn direct_addr_is_socket_addr() {
+        let remote = TransportAddr::Ip("198.51.100.42:46324".parse().unwrap());
+        assert_eq!(path_addr(&remote).as_deref(), Some("198.51.100.42:46324"));
+    }
+
+    #[test]
+    fn relay_addr_is_host_only() {
+        let url = "https://use1-1.relay.iroh.network".parse().unwrap();
+        let remote = TransportAddr::Relay(url);
+        assert_eq!(
+            path_addr(&remote).as_deref(),
+            Some("use1-1.relay.iroh.network")
+        );
+    }
+
+    #[test]
+    fn addr_is_omitted_when_none() {
+        let p = PeerPath {
+            peer: "p".into(),
+            kind: "direct",
+            rtt_ms: 0,
+            addr: None,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("addr"));
     }
 }
