@@ -104,6 +104,13 @@ running (see teapot-control CLAUDE.md).
 - **Presence needs a silence timeout.** A phone stayed "connected" to nothing
   for 8 h (process alive, socket dead). 45 s without any message from control
   → reconnect (`SILENCE_LIMIT`).
+- **The presence handshake needs its own timeout.** `SILENCE_LIMIT` only runs
+  once the socket is connected; `connect_async` itself has none. A NAT VPS
+  (nat-node-001 behind Sumopod NAT) accepted the TCP connection but never
+  finished the WebSocket upgrade — presence hung silently for 2 h with zero
+  `presence connected` while the HTTP loop kept timing out. Both WS handshakes
+  are now wrapped in `CONTROL_TIMEOUT` (`connect_ws`) so the stall surfaces as
+  an error the existing backoff loop logs and retries.
 - **A restarted exit leaves a silent connection, not a closed one.** Same id,
   new process: the cached connection never errors until QUIC's idle timeout.
   Reused connections get 5 s; no datagram at all from the peer → close, redial,
