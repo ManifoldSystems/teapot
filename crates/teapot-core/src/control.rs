@@ -28,6 +28,11 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(45);
 const STATUS_EVERY: Duration = Duration::from_secs(5);
 /// Re-send an unchanged status this often so the dashboard never goes stale.
 const STATUS_REFRESH: Duration = Duration::from_secs(60);
+/// Flush buffered logs to control this often. Decoupled from `STATUS_EVERY` to
+/// stay inside the Cloudflare Workers free tier: one `POST /v1/logs` per device
+/// per minute instead of one every 5 s (~12x fewer requests). Each cycle drains
+/// the whole backlog, so a burst still arrives in full, just up to a minute late.
+const LOG_PUSH_EVERY: Duration = Duration::from_secs(60);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Cap on any single request to control — the HTTP client and the WebSocket
 /// handshake alike. Without it a stalled handshake (TCP open, no RST, no
@@ -415,11 +420,20 @@ impl ControlClient {
         let presence = self.clone();
         tokio::join!(presence.presence_loop(paths), async {
             loop {
-                tokio::time::sleep(STATUS_EVERY).await;
+                tokio::time::sleep(LOG_PUSH_EVERY).await;
                 if let Some(buffer) = crate::logs::buffer() {
-                    let entries = buffer.batch();
-                    if !entries.is_empty() && self.upload_logs(&entries).await.is_ok() {
-                        buffer.ack(&entries);
+                    // Drain the whole backlog each cycle: `batch` caps at 20, so a
+                    // busy minute needs several POSTs, but a quiet agent sends one.
+                    loop {
+                        let entries = buffer.batch();
+                        if entries.is_empty() {
+                            break;
+                        }
+                        if self.upload_logs(&entries).await.is_ok() {
+                            buffer.ack(&entries);
+                        } else {
+                            break; // control unreachable; retry next cycle
+                        }
                     }
                 }
             }
