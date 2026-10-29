@@ -122,9 +122,15 @@ and allowlists. Do not gradually split traffic across Worker versions.
 ```
 client → "ping"                        server → "pong"
 client → {"type":"status",
-          "paths":[{"peer":<node_id>,"kind":"direct"|"relay","rtt_ms":n (-1 = unknown)}],
+          "paths":[{"peer":<node_id>,"kind":"direct"|"relay","rtt_ms":n (-1 = unknown),
+                    "addr":"a.b.c.d:port" | "<relay host>" (optional)}],
           "traffic":[{"peer":<node_id>,"tx":bytes,"rx":bytes}],
           "ips":{"v4":"a.b.c.d"?,"v6":"x:y::z"?}}
+         addr = the selected path's remote address: the peer's socket address
+         (ip:port) when direct, the relay host when relay. Optional and
+         omitted when unknown; legacy agents never send it. Direct paths may
+         carry a Tailscale `100.64.0.0/10` address (same tailnet), which looks
+         like NAT traversal but is not public-IP direct.
          traffic = tunnel payload since the agent started, from the sender's
          side (tx went to the peer, rx came from it)
          ips = this device's public addresses from its own iroh endpoint
