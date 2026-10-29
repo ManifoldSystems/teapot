@@ -29,6 +29,11 @@ const STATUS_EVERY: Duration = Duration::from_secs(5);
 /// Re-send an unchanged status this often so the dashboard never goes stale.
 const STATUS_REFRESH: Duration = Duration::from_secs(60);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Cap on any single request to control — the HTTP client and the WebSocket
+/// handshake alike. Without it a stalled handshake (TCP open, no RST, no
+/// upgrade reply — a NAT VPS that silently drops packets) hangs the presence
+/// loop forever, because `SILENCE_LIMIT` only starts once the socket connects.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// What the presence status message carries.
 type Report = (Vec<PeerPath>, Vec<PeerTraffic>, PublicIps);
@@ -154,7 +159,7 @@ impl ControlClient {
     pub fn new(base: &str, key: SecretKey) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(20))
+            .timeout(CONTROL_TIMEOUT)
             .build()?;
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
@@ -316,7 +321,7 @@ impl ControlClient {
         );
         req.headers_mut()
             .insert("user-agent", HeaderValue::from_static(USER_AGENT));
-        let (mut ws, _) = match tokio_tungstenite::connect_async(req).await {
+        let (mut ws, _) = match connect_ws(req, CONTROL_TIMEOUT).await {
             Ok(ok) => ok,
             Err(tungstenite::Error::Http(res)) if res.status() == StatusCode::UNAUTHORIZED => {
                 *self.token.lock().await = None;
@@ -456,7 +461,7 @@ impl ControlClient {
         headers.insert("x-teapot-version", HeaderValue::from_static(AGENT_VERSION));
         headers.insert("x-teapot-protocol", HeaderValue::from_static("1"));
 
-        let (ws, _) = match tokio_tungstenite::connect_async(req).await {
+        let (ws, _) = match connect_ws(req, CONTROL_TIMEOUT).await {
             Ok(ok) => ok,
             Err(tungstenite::Error::Http(res)) if res.status() == StatusCode::UNAUTHORIZED => {
                 *self.token.lock().await = None;
@@ -534,6 +539,26 @@ impl ControlClient {
     }
 }
 
+/// Open the presence/log WebSocket, giving up after `timeout` instead of
+/// hanging forever when control accepts the TCP connection but never finishes
+/// the upgrade. The timeout comes back as an `Io`/`TimedOut` error, so the
+/// callers' existing error path logs it and the loop reconnects.
+async fn connect_ws(
+    req: tungstenite::handshake::client::Request,
+    timeout: Duration,
+) -> tungstenite::Result<(
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tungstenite::handshake::client::Response,
+)> {
+    match tokio::time::timeout(timeout, tokio_tungstenite::connect_async(req)).await {
+        Ok(result) => result,
+        Err(_) => Err(tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("control websocket handshake exceeded {timeout:?}"),
+        ))),
+    }
+}
+
 async fn parse<T: DeserializeOwned>(res: reqwest::Response) -> anyhow::Result<T> {
     let status = res.status();
     let text = res.text().await?;
@@ -550,5 +575,41 @@ async fn parse<T: DeserializeOwned>(res: reqwest::Response) -> anyhow::Result<T>
             message: env.message.unwrap_or_else(|| "request failed".into()),
         }
         .into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A handshake to a peer that accepts the TCP connection but never answers
+    /// the WebSocket upgrade must fail within the timeout, not hang forever.
+    #[tokio::test]
+    async fn stalled_handshake_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept connections and hold them open without ever replying.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let req = format!("ws://{addr}/v1/presence")
+            .into_client_request()
+            .unwrap();
+        let timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let err = connect_ws(req, timeout).await.unwrap_err();
+
+        assert!(
+            matches!(err, tungstenite::Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "handshake should give up near the timeout, took {:?}",
+            started.elapsed()
+        );
     }
 }
