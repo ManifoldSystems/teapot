@@ -3027,6 +3027,7 @@ dependencies = [
  "iroh",
  "rand",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "teapot-proto",

@@ -161,6 +161,26 @@ async fn lan_is_blocked_by_default() {
 }
 
 #[tokio::test]
+async fn clearing_live_allowlist_disconnects_existing_peer() {
+    let lookup = MemoryLookup::new();
+    let client = endpoint(&lookup).await;
+    let (tx, rx) = tokio::sync::watch::channel(HashSet::from([client.id()]));
+    let (exit, _router) = exit_node(&lookup, Allow::Live(rx), true).await;
+    let conn = client.connect(exit, ALPN_PROXY).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let target = target().await;
+    send.write_all(format!("CONNECT {target}\n").as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(teapot_proto::read_line(&mut recv).await.unwrap(), "OK");
+    tx.send(HashSet::new()).unwrap();
+    tokio::time::timeout(TIMEOUT, conn.closed())
+        .await
+        .expect("revocation must close established connections");
+    client.close().await;
+}
+
+#[tokio::test]
 async fn unlisted_client_is_refused() {
     let lookup = MemoryLookup::new();
     let client_ep = endpoint(&lookup).await;

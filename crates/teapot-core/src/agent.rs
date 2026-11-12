@@ -77,9 +77,8 @@ pub async fn join(
 /// Keeps an exit node's allowlist equal to control's. Refetches on every
 /// `peers_changed` and every 30 s.
 ///
-/// Each new list is written to `cache`, so a restart while control is
-/// unreachable starts from the last known list instead of refusing everyone
-/// (see [`load_allowlist`]).
+/// Each new list is written to `cache` for diagnostics only. Failed refreshes
+/// clear live authorization; restarts require fresh authorization from control.
 pub async fn sync_allowlist(
     control: Arc<ControlClient>,
     tx: watch::Sender<HashSet<EndpointId>>,
@@ -89,7 +88,9 @@ pub async fn sync_allowlist(
     let mut enabled: Option<bool> = None;
     let mut cached_once = false;
     loop {
-        match control.allowlist().await {
+        let refreshed =
+            tokio::time::timeout(std::time::Duration::from_secs(20), control.allowlist()).await;
+        match refreshed.unwrap_or_else(|_| Err(anyhow::anyhow!("allowlist refresh timed out"))) {
             Ok(list) => {
                 if enabled != Some(list.exit_enabled) {
                     if list.exit_enabled {
@@ -123,22 +124,30 @@ pub async fn sync_allowlist(
                     }
                 }
             }
-            Err(e) if control::is_pending(&e) => {}
-            Err(e) => warn!("allowlist: {e:#}"),
+            Err(e) => {
+                warn!("allowlist unavailable; denying all clients: {e:#}");
+                tx.send_if_modified(|current| {
+                    if current.is_empty() {
+                        return false;
+                    }
+                    current.clear();
+                    true
+                });
+                if let Some(path) = &cache {
+                    let _ = std::fs::remove_file(path);
+                }
+                cached_once = false;
+            }
         }
         wait_for_change(&mut changed).await;
     }
 }
 
-/// The allowlist cached by [`sync_allowlist`], if any.
+/// Legacy API: persisted snapshots no longer grant authorization on restart.
 pub fn load_allowlist(path: &Path) -> Option<HashSet<EndpointId>> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let ids: Vec<String> = serde_json::from_str(&text).ok()?;
-    Some(
-        ids.iter()
-            .filter_map(|id| EndpointId::from_str(id).ok())
-            .collect(),
-    )
+    // Historical snapshots are diagnostic only, never authorization on restart.
+    let _ = path;
+    None
 }
 
 fn save_allowlist(path: &Path, set: &HashSet<EndpointId>) -> anyhow::Result<()> {
@@ -300,9 +309,52 @@ mod tests {
         let path = dir.join("allowlist.json");
         let set: HashSet<EndpointId> = (0..3).map(|_| SecretKey::generate().public()).collect();
         save_allowlist(&path, &set).unwrap();
-        assert_eq!(load_allowlist(&path), Some(set));
+        assert_eq!(load_allowlist(&path), None);
         assert_eq!(load_allowlist(&dir.join("missing.json")), None);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn rejected_control_clears_live_authorization() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                (
+                    "200 OK",
+                    r#"{"success":true,"data":{"challenge":"test-challenge"}}"#,
+                ),
+                (
+                    "200 OK",
+                    r#"{"success":true,"data":{"token":"test-token","status":"approved"}}"#,
+                ),
+                (
+                    "403 Forbidden",
+                    r#"{"success":false,"error":"PENDING","message":"revoked"}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                assert!(read > 0);
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            }
+        });
+        let control = Arc::new(ControlClient::new(&base, SecretKey::generate()).unwrap());
+        let (tx, mut rx) = watch::channel(HashSet::from([SecretKey::generate().public()]));
+        let task = tokio::spawn(sync_allowlist(control, tx, None));
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rx.borrow().is_empty(),
+            "rejected control must revoke existing peers"
+        );
+        task.abort();
+        server.await.unwrap();
     }
 
     #[test]

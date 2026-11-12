@@ -86,6 +86,15 @@ POST /v1/auth/verify {node_id, challenge, signature}
 | PUT | `/v1/devices/me` | `{name?, platform?, model?, can_exit?}`; omitted fields are kept. `can_exit` = the device serves exit right now; the owner's exit toggle is stored separately and survives restarts |
 | GET | `/v1/peers` | `[{node_id, name, device_name, platform, model, online, exit, public_ipv4}]` — `name` is the owner's alias when set (so `--exit`/`via=` can use it), `device_name` what the device reports; `403 PENDING` until approved. Clients skip exits whose `public_ipv4` equals their own |
 | GET | `/v1/exit/allowlist` | `{exit_enabled, allow: [node_id]}`; `403 PENDING` until approved |
+
+Exit authorization fails closed: start with an empty allowlist and clear it on
+any failed refresh (including pending, removal, and network failure). A persisted
+allowlist must not authorize traffic after restart. Refresh at least every 30 s;
+each refresh has a 20 s deadline. Clearing the list disconnects existing peers.
+
+Dashboard sessions use independent random cookies backed by server-side records
+with a 30-day expiry. Logout deletes that session; rotating either admin/control
+secret invalidates existing sessions. Browser mutations must be same-origin.
 | GET | `/v1/presence` | WebSocket upgrade; token as Bearer or `?token=` |
 
 `401` means authenticate again (expired token, or the device was removed).

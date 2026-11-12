@@ -70,9 +70,10 @@ and restored on shutdown (Ctrl+C or the service stopping), on the next start
 after a crash, by `teapot service uninstall`, or by hand with
 `teapot system-proxy off`. Needs an admin account (`networksetup`).
 
-**Exit nodes keep working when control is down.** The last allowlist from
-control is cached next to the key (`secret.allowlist.json`) and used at
-startup until control answers again.
+**Exit nodes require current authorization from control.** A failed refresh
+clears the allowlist and disconnects peers. Restarts begin with no authorized
+peers; the snapshot next to the key is diagnostic only. Refreshes run every
+30 seconds with a 20-second deadline, so control outages interrupt exit traffic.
 
 Point apps at `http://127.0.0.1:1080`:
 
