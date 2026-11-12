@@ -177,3 +177,8 @@ crates/teapot         CLI, service install (launchd / systemd)
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development checks and pull requests,
+and [SECURITY.md](SECURITY.md) for vulnerability reporting and deployment boundaries.
