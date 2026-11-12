@@ -5,7 +5,7 @@ use std::{path::PathBuf, process::Command};
 
 use anyhow::{Context, bail};
 
-use crate::{DEFAULT_CONTROL, UpArgs};
+use crate::UpArgs;
 
 #[cfg(target_os = "macos")]
 const LABEL: &str = "com.manifoldsystems.teapot";
@@ -19,9 +19,8 @@ pub fn global_args(key: &Option<PathBuf>, control: &str, name: &Option<String>) 
         let key = std::path::absolute(key).unwrap_or_else(|_| key.clone());
         out.extend(["--key".into(), key.display().to_string()]);
     }
-    if control != DEFAULT_CONTROL {
-        out.extend(["--control".into(), control.to_string()]);
-    }
+    // Persist even the default so a future binary cannot change the destination.
+    out.extend(["--control".into(), control.to_string()]);
     if let Some(name) = name {
         out.extend(["--name".into(), name.clone()]);
     }
@@ -339,7 +338,10 @@ mod tests {
     #[test]
     fn defaults_stay_off_the_command_line() {
         assert_eq!(up_args(&args()), ["up"]);
-        assert!(global_args(&None, DEFAULT_CONTROL, &None).is_empty());
+        assert_eq!(
+            global_args(&None, crate::DEFAULT_CONTROL, &None),
+            ["--control", crate::DEFAULT_CONTROL]
+        );
     }
 
     #[test]

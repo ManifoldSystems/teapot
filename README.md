@@ -30,9 +30,11 @@ Binary: `target/release/teapot`.
 
 ## Use
 
-On every device, once:
+Deploy [teapot-control](https://github.com/ManifoldSystems/teapot-control)
+first, then point each device at your deployment:
 
 ```bash
+export TEAPOT_CONTROL=https://teapot.example.com  # replace with your URL
 teapot login              # opens the approval page; confirm "Add this device?"
 teapot service install    # runs `teapot up` in the background, restarts it if it dies
 ```
@@ -50,7 +52,9 @@ teapot service install    # runs `teapot up` in the background, restarts it if i
   proxy).
 
 Options given to `teapot service install` are passed to `up`, e.g.
-`teapot service install --exit phone-exit`. `teapot service status` and
+`teapot service install --exit phone-exit`. The control URL is saved in the
+installed service; keep `TEAPOT_CONTROL` set for interactive commands.
+`teapot service status` and
 `teapot service uninstall` do what they say. macOS uses a launchd agent
 (runs while you are logged in); Linux uses a systemd user unit (add
 `sudo loginctl enable-linger $USER` to run without a login session).
@@ -80,7 +84,7 @@ It prints B's public IP. Name a different exit for a single request with the
 proxy username, and list the choices from the proxy itself:
 
 ```bash
-curl -x http://home-exit@127.0.0.1:1080 https://ifconfig.me   # this request via home-exit
+curl -x http://home-exit@127.0.0.1:1080 https://ifconfig.me     # this request via home-exit
 curl http://127.0.0.1:1080/_teapot/exits                         # what can be named
 ```
 
@@ -107,7 +111,7 @@ teapot proxy --no-control <B_ID>           # on A
 | Flag | Where | Meaning |
 |---|---|---|
 | `--key <path>` / `TEAPOT_KEY` | all | Secret key file. Default: `<config dir>/teapot/secret.key` |
-| `--control <url>` / `TEAPOT_CONTROL` | all | Control plane. Default: `https://teapot.example.com` |
+| `--control <url>` / `TEAPOT_CONTROL` | all | Your control plane. Default: `http://127.0.0.1:8787` (local development only) |
 | `--name <name>` / `TEAPOT_NAME` | all | Name in the dashboard. Default: hostname |
 | `--allow <id>` | exit | Static allowlist, skips control; repeatable |
 | `--allow-any` | exit | Any endpoint, skips control. Local experiments only |
@@ -134,10 +138,10 @@ The disk writer and upload queue are bounded so logging cannot stall tunnels.
 ```bash
 teapot logs                         # latest local events; works offline
 teapot logs --follow                 # follow local history
-teapot logs phone-exit --follow        # watch another approved device
+teapot logs phone-exit --follow      # watch another approved device
 teapot logs --all --follow           # all devices + control
 teapot logs control --level warn     # control warnings/errors
-teapot logs phone-exit --json          # JSONL for tooling
+teapot logs phone-exit --json        # JSONL for tooling
 RUST_LOG=teapot=debug,teapot_core=debug teapot up  # include tunnel details
 ```
 
@@ -169,3 +173,7 @@ crates/teapot         CLI, service install (launchd / systemd)
 - `--system-proxy` tried on a real Mac (written and unit-tested; it changes
   system network settings, so run it yourself first)
 - systemd unit tried on a Raspberry Pi (runs on Ubuntu 24.04 x86_64)
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -3,16 +3,14 @@
 Personal mesh on [iroh](https://iroh.computer): devices dial each other by
 endpoint id; first feature is an **exit node** — traffic from one device leaves
 the internet with another device's IP. Rust agent + CLI. The control plane is a
-separate repo, `ManifoldSystems/teapot-control` (Hono on Cloudflare Workers,
-live at `https://teapot.example.com`).
+separate repo, `ManifoldSystems/teapot-control` (Hono on Cloudflare Workers).
 
-Owner: Eric (algonacci). Private, single-tenant: one deployment per owner;
-buyers get a clone. **Scope stays small** — only what the owner actually uses.
+MIT licensed, single-tenant: deploy your own control plane.
+**Scope stays small** — personal meshes and exit nodes.
 The broad hub-less mesh (exec, flows, ingress, IoT) is Rin's (r17x) `fpx`; Rin
 allows reusing fpx code with attribution, but only pull in what fits this scope.
 
-Design history and lessons live in `private deployment notes`
-(read its README first). This file is the operating manual.
+This file is the operating manual; `docs/protocol.md` defines the wire protocol.
 
 ## Layout
 
@@ -49,16 +47,17 @@ cargo fmt
 CLI essentials (`teapot --help` for all):
 
 ```bash
+export TEAPOT_CONTROL=https://teapot.example.com  # your deployment
 teapot login                         # opens /approve/<id>; waits for "Add device"
 teapot service install [--exit NAME] # runs `teapot up` under launchd/systemd
 teapot service status|uninstall
 teapot status                        # approval, exit, public IPs, peers
-teapot up --exit phone-exit            # exit node + local proxy 127.0.0.1:1080
+teapot up --exit phone-exit           # exit node + local proxy 127.0.0.1:1080
 teapot system-proxy off              # undo a stuck --system-proxy
 ```
 
 Global flags baked into the service: `--key`, `--control`
-(default `https://teapot.example.com`), `--name` (default hostname).
+(default `http://127.0.0.1:8787` for local development), `--name` (default hostname).
 
 ## Conventions
 
@@ -72,25 +71,22 @@ Global flags baked into the service: `--key`, `--control`
 
 ## Rollout to the fleet
 
-Machines and their roles are listed in private deployment notes
-(fleet table). macOS binaries are built here; Linux binaries are built on
-`office-exit` (Ubuntu 24.04, glibc 2.39) and copied to the other Ubuntu hosts —
-cross-compiling from macOS fails because `ring` needs a C cross-compiler.
+Build Linux binaries on a compatible Linux builder: cross-compiling from
+macOS requires a target C toolchain for `ring`. Substitute your own hosts below.
 
 ```bash
 cargo build --release && install -m 755 target/release/teapot ~/.local/bin/teapot
-rsync -az --exclude target --exclude .git ./ office-exit:teapot-src/
-ssh office-exit 'cd ~/teapot-src && ~/.cargo/bin/cargo build --release'
-scp -3 office-exit:teapot-src/target/release/teapot <host>:/tmp/teapot   # then install
-<host>: ~/.local/bin/teapot [--name NAME] service install [--exit NAME]
+rsync -az --exclude target --exclude .git ./ <builder>:teapot-src/
+ssh <builder> 'cd ~/teapot-src && ~/.cargo/bin/cargo build --release'
+scp -3 <builder>:teapot-src/target/release/teapot <host>:/tmp/teapot   # then install
+<host>: ~/.local/bin/teapot --control <URL> [--name NAME] service install [--exit NAME]
 ```
 
 `service install` restarts the service and must be given the same flags again
-(name, exit) — it rewrites the unit/plist from its own arguments.
+(control URL, name, exit) — it rewrites the unit/plist from its own arguments.
 
-If the control plane change touches the Durable Object (`presence.ts`), stop
-**every** agent for ~80 s before restarting them, or the old DO code keeps
-running (see teapot-control CLAUDE.md).
+Use teapot-control's generation-based deploy script when changing the Durable
+Object (`presence.ts`); see its README for retirement and recovery.
 
 ## Gotchas learned the hard way
 
@@ -106,7 +102,7 @@ running (see teapot-control CLAUDE.md).
   → reconnect (`SILENCE_LIMIT`).
 - **The presence handshake needs its own timeout.** `SILENCE_LIMIT` only runs
   once the socket is connected; `connect_async` itself has none. A NAT VPS
-  (nat-exit behind provider NAT) accepted the TCP connection but never
+  behind provider NAT accepted the TCP connection but never
   finished the WebSocket upgrade — presence hung silently for 2 h with zero
   `presence connected` while the HTTP loop kept timing out. Both WS handshakes
   are now wrapped in `CONTROL_TIMEOUT` (`connect_ws`) so the stall surfaces as
@@ -117,7 +113,7 @@ running (see teapot-control CLAUDE.md).
   retry once (`REUSED_ANSWER_TIMEOUT`, test `restarted_exit_is_redialed…`).
 - **Never hold the proxy state lock across a dial** — failover would wait for a
   dead exit to time out.
-- **Paths via Tailscale.** All fleet machines share a tailnet; iroh often picks
+- **Paths via Tailscale.** On machines sharing a tailnet, iroh may pick
   `100.x` addresses as "direct". Check the address before claiming NAT
   traversal.
 - **zsh does not word-split `$VAR`.** `for h in $HOSTS` runs once with the whole
@@ -133,8 +129,7 @@ running (see teapot-control CLAUDE.md).
 
 - Admin password for the dashboard: `teapot-control/.admin-token`
   (gitignored). Never print it.
-- Several fleet hosts are production (nginx/docker): cloud-exit,
-  vps-exit, edge-exit. Do not touch their other services; teapot runs as an
-  unprivileged user unit there. sudo needs the owner (except where noted).
+- Run teapot as an unprivileged user service. Do not modify unrelated services
+  on deployment hosts; coordinate privileged operations with their owner.
 - Changing system settings on any host (linger, journald groups, proxy) is the
   owner's call: print the command, let them run it.
