@@ -17,12 +17,17 @@ only decides who may talk to whom.
 
 ## Build
 
+Teapot is distributed as source code only. Clone this repository and build your
+own agent; we do not distribute prebuilt binaries, installers, or package releases.
+
 Agents from 0.2.0 report their application version and presence protocol on
 connect. Reconnects use randomized exponential backoff and log the control
 version/generation handshake. See `teapot-control/README.md` for generation-based
 deployment and retirement recovery, including legacy Android clients.
 
 ```bash
+git clone https://github.com/ManifoldSystems/teapot.git
+cd teapot
 cargo build --release
 ```
 
